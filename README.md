@@ -12,6 +12,12 @@ GhostCheck es una auditoría de seguridad para servidores **RHEL / Rocky / AlmaL
 
 Funciona en **modo DRY-RUN**: solo lee el sistema, nunca lo modifica (ver [Garantías DRY-RUN](#garantías-dry-run)).
 
+| Terminal | Informe HTML |
+|---|---|
+| ![Salida de GhostCheck en la terminal: hallazgos por módulo con su severidad y recomendaciones](docs/terminal.png) | ![Informe HTML de GhostCheck con el nivel de riesgo y el detalle de cada módulo](docs/informe.png) |
+
+<sub>Capturas de una auditoría sobre un servidor simulado (`python docs/demo/generar_capturas.py`): no se ejecuta nada en un sistema real.</sub>
+
 ### Requisitos
 
 - Python **3.9 o superior** (el Python del sistema en RHEL 9 sirve tal cual).
@@ -35,7 +41,10 @@ sudo ./ghostcheck.py
 # 3) Como paquete Python (instala el comando `ghostcheck`)
 pip install git+https://github.com/jaimefgdev/ghostcheck.git
 
-# 4) Como RPM (desde la raíz del repositorio, requiere rpm-build)
+# 4) RPM ya construido: descárgalo de https://github.com/jaimefgdev/GhostCheck/releases/latest
+sudo dnf install ./ghostcheck-*.noarch.rpm
+
+# 5) Construyendo el RPM (desde la raíz del repositorio, requiere rpm-build)
 rpmbuild -bb --define "_sourcedir $PWD" packaging/ghostcheck.spec
 sudo dnf install ~/rpmbuild/RPMS/noarch/ghostcheck-*.noarch.rpm
 ```
@@ -178,6 +187,12 @@ GhostCheck is a security audit for **RHEL / Rocky / AlmaLinux / CentOS Stream / 
 
 It runs in **DRY-RUN mode**: it only reads the system and never changes it (see [DRY-RUN guarantees](#dry-run-guarantees)). Console output and reports are in Spanish.
 
+| Terminal | HTML report |
+|---|---|
+| ![GhostCheck console output: findings per module with severity and recommendations](docs/terminal.png) | ![GhostCheck HTML report with the risk level and the details of each module](docs/informe.png) |
+
+<sub>Screenshots of an audit of a simulated server (`python docs/demo/generar_capturas.py`): nothing runs on a real system.</sub>
+
 ### Requirements
 
 - Python **3.9+** (the system Python on RHEL 9 works as is).
@@ -197,7 +212,10 @@ git clone https://github.com/jaimefgdev/ghostcheck.git && cd ghostcheck && sudo 
 # 3) As a Python package (installs the `ghostcheck` command)
 pip install git+https://github.com/jaimefgdev/ghostcheck.git
 
-# 4) As an RPM (from the repository root, needs rpm-build)
+# 4) Prebuilt RPM: download it from https://github.com/jaimefgdev/GhostCheck/releases/latest
+sudo dnf install ./ghostcheck-*.noarch.rpm
+
+# 5) As an RPM (from the repository root, needs rpm-build)
 rpmbuild -bb --define "_sourcedir $PWD" packaging/ghostcheck.spec
 sudo dnf install ~/rpmbuild/RPMS/noarch/ghostcheck-*.noarch.rpm
 ```
