@@ -1672,7 +1672,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     como_root = es_root()
     if not como_root and not args.allow_non_root:
         consola.error("[✘ ERROR] Este script debe ejecutarse como root (UID 0).")
-        consola.error("  Utiliza: sudo python3 ghostcheck.py   (o --allow-non-root para una auditoría parcial)")
+        consola.error("  Utiliza: sudo ghostcheck  (o sudo python3 ghostcheck.py);"
+                      " --allow-non-root permite una auditoría parcial.")
         return SALIDA_ERROR
     consola.linea("[✔] Ejecutando como root. Privilegios verificados.\n" if como_root else
                   "[⚠] Ejecutando SIN root: la auditoría será parcial e INCOMPLETA.\n")
