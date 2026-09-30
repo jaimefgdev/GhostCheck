@@ -9,7 +9,7 @@ Garantías que aplica a TODOS los tests (fixture autouse ``sistema_aislado``):
     de la del script: cualquier intento de ejecutar un comando que no esté en
     ella hace fallar el test al instante, aunque el script lo bloqueara.
   * ``shutil.which`` se simula: solo "existen" los binarios declarados con
-    ``comandos.instalar``.
+    ``comandos.instalar``. ``socket.gethostname`` devuelve un nombre fijo.
   * Las rutas del sistema (/etc/passwd, /etc/shadow, sshd_config) apuntan a
     ficheros inexistentes dentro de ``tmp_path`` y el directorio de trabajo
     es ``tmp_path``, así que los reportes nunca se escriben en el repositorio.
@@ -133,13 +133,16 @@ def sistema_aislado(monkeypatch, tmp_path, comandos):
     monkeypatch.setattr(ghostcheck, "ejecutar_comando", ejecutar_vigilado)
     monkeypatch.setattr(ghostcheck.subprocess, "run", comandos.run)
     monkeypatch.setattr(ghostcheck.shutil, "which", comandos.which)
+    monkeypatch.setattr(ghostcheck.socket, "gethostname", lambda: "host-simulado")
 
     etc = tmp_path / "etc"
     etc.mkdir()
-    monkeypatch.setattr(ghostcheck, "RUTA_PASSWD", str(etc / "passwd"))
-    monkeypatch.setattr(ghostcheck, "RUTA_SHADOW", str(etc / "shadow"))
-    monkeypatch.setattr(ghostcheck, "RUTA_SSHD_CFG", str(etc / "ssh" / "sshd_config"))
-    monkeypatch.setattr(ghostcheck, "RUTA_SELINUX_CFG", str(etc / "selinux" / "config"))
+    monkeypatch.setattr(ghostcheck, "RUTAS", ghostcheck.Rutas(
+        passwd=str(etc / "passwd"),
+        shadow=str(etc / "shadow"),
+        sshd_config=str(etc / "ssh" / "sshd_config"),
+        selinux_config=str(etc / "selinux" / "config"),
+    ))
     monkeypatch.chdir(tmp_path)
     return ejecutar_real
 
@@ -154,3 +157,25 @@ def ejecutar_real(sistema_aislado):
 @pytest.fixture
 def etc(tmp_path) -> Path:
     return tmp_path / "etc"
+
+
+def resultado(nombre: str, *codigos: str, errores: tuple[str, ...] = (), **datos) -> ghostcheck.ResultadoModulo:
+    """ResultadoModulo de prueba con los hallazgos y errores indicados."""
+    r = ghostcheck.ResultadoModulo(nombre, datos=dict(datos))
+    for c in codigos:
+        r.hallazgo(c, f"mensaje {c}")
+    for e in errores:
+        r.error(e)
+    return r
+
+
+def informe(*resultados: ghostcheck.ResultadoModulo, como_root: bool = True,
+            hostname: str = "srv.example.test", omitidos: list[str] | None = None) -> ghostcheck.Informe:
+    from datetime import datetime
+    return ghostcheck.Informe(
+        fecha=datetime(2026, 1, 2, 3, 4, 5),
+        hostname=hostname,
+        como_root=como_root,
+        resultados={r.nombre: r for r in resultados},
+        omitidos=omitidos or [],
+    )

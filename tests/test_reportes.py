@@ -2,74 +2,81 @@
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 
 import pytest
 
 import ghostcheck
+from conftest import informe, resultado
 
 XSS = '<script>alert("x")</script>'
 
 
-def resultados_maliciosos() -> dict:
-    return {
-        "selinux": {"estado": XSS, "modo": XSS, "politica": XSS, "advertencias": [XSS], "ok": False},
-        "firewall": {"herramienta": XSS, "activo": True, "puertos_abiertos": [XSS],
-                     "puertos_a_revisar": [XSS], "advertencias": [XSS]},
-        "usuarios": {"usuarios_uid0_no_root": [XSS], "cuentas_sin_contrasena": [XSS],
-                     "total_usuarios": 1, "advertencias": [XSS]},
-        "ssh": {"ruta_config": XSS, "puerto_ssh": XSS, "ok": False, "advertencias": [XSS],
-                "fuente": XSS, "errores": [XSS],
-                "directivas_riesgo": [{"directiva": XSS, "valor": XSS, "linea_num": 1, "origen": XSS,
-                                       "archivo": XSS, "descripcion": XSS}]},
-        "actualizaciones": {"gestor": XSS, "estado": XSS, "total_pendientes": 1,
-                            "paquetes_pendientes": [XSS], "advertencias": [XSS]},
-    }
+def informe_malicioso() -> ghostcheck.Informe:
+    modulos = []
+    for nombre in ghostcheck.MODULOS:
+        r = resultado(nombre, errores=(XSS,), estado=XSS, modo=XSS, politica=XSS, herramienta=XSS,
+                      puertos_abiertos=[XSS], usuarios_uid0_no_root=[XSS], ruta_config=XSS,
+                      fuente=XSS, gestor=XSS, paquetes_pendientes=[XSS], severidades={XSS: 1})
+        r.hallazgos.append(ghostcheck.Hallazgo("x", "ALTO", XSS))
+        r.info.append(XSS)
+        r.recomendaciones.append(XSS)
+        modulos.append(r)
+    return informe(*modulos, hostname=XSS)
 
 
-def test_html_escapa_todos_los_datos_del_sistema(tmp_path, comandos):
-    comandos.registrar(["hostname", "-f"], stdout=XSS)
-    ruta = ghostcheck.generar_reporte_html(resultados_maliciosos(), str(tmp_path / "r.html"))
-    contenido = open(ruta, encoding="utf-8").read()
+def test_html_escapa_todos_los_datos_del_sistema():
+    contenido = ghostcheck.renderizar_html(informe_malicioso())
     assert "<script" not in contenido
     assert "&lt;script&gt;" in contenido
 
 
-def test_html_incluye_csp_restrictiva(tmp_path):
-    ruta = ghostcheck.generar_reporte_html({}, str(tmp_path / "r.html"))
-    contenido = open(ruta, encoding="utf-8").read()
+def test_html_incluye_csp_restrictiva():
+    contenido = ghostcheck.renderizar_html(informe())
     assert "Content-Security-Policy" in contenido
     assert "default-src 'none'" in contenido
 
 
-def test_html_con_valores_none_no_muestra_none(tmp_path):
-    res = {"selinux": {"modo": None, "politica": None, "advertencias": []}}
-    ruta = ghostcheck.generar_reporte_html(res, str(tmp_path / "r.html"))
-    assert ">None<" not in open(ruta, encoding="utf-8").read()
+def test_valores_none_no_se_muestran_como_none():
+    r = resultado("selinux", modo=None, politica=None)
+    assert ">None<" not in ghostcheck.renderizar_html(informe(r))
+    assert ": None" not in ghostcheck.renderizar_txt(informe(r))
 
 
-@pytest.mark.parametrize("generar", [ghostcheck.generar_reporte_txt, ghostcheck.generar_reporte_html])
-def test_reportes_se_crean_con_permisos_0600(generar, tmp_path):
-    ruta = generar({}, str(tmp_path / "r"))
-    assert stat.S_IMODE(os.stat(ruta).st_mode) == 0o600
+def test_json_es_valido_y_completo():
+    datos = json.loads(ghostcheck.renderizar_json(informe(resultado("ssh", "ssh_permit_root_login"))))
+    assert datos["nivel_riesgo"] == "CRÍTICO"
+    assert datos["modo"] == "DRY-RUN"
+    assert datos["modulos"]["ssh"]["hallazgos"][0]["codigo"] == "ssh_permit_root_login"
 
 
-@pytest.mark.parametrize("generar", [ghostcheck.generar_reporte_txt, ghostcheck.generar_reporte_html])
-def test_reportes_no_sobrescriben_ficheros_existentes(generar, tmp_path):
-    existente = tmp_path / "r"
+@pytest.mark.parametrize("formato", ghostcheck.FORMATOS_REPORTE)
+def test_reportes_se_crean_con_permisos_0600(formato, tmp_path):
+    rutas, errores = ghostcheck.guardar_reportes(informe(), str(tmp_path), [formato])
+    assert errores == []
+    assert stat.S_IMODE(os.stat(rutas[0]).st_mode) == 0o600
+
+
+@pytest.mark.parametrize("formato", ghostcheck.FORMATOS_REPORTE)
+def test_reportes_no_sobrescriben_ficheros_existentes(formato, tmp_path):
+    inf = informe()
+    existente = tmp_path / ghostcheck.nombre_reporte(inf, formato)
     existente.write_text("original")
-    generar({}, str(existente))
+    rutas, errores = ghostcheck.guardar_reportes(inf, str(tmp_path), [formato])
+    assert rutas == [] and errores
     assert existente.read_text() == "original"
 
 
-@pytest.mark.parametrize("generar", [ghostcheck.generar_reporte_txt, ghostcheck.generar_reporte_html])
-def test_reportes_no_siguen_enlaces_simbolicos(generar, tmp_path):
+@pytest.mark.parametrize("formato", ghostcheck.FORMATOS_REPORTE)
+def test_reportes_no_siguen_enlaces_simbolicos(formato, tmp_path):
+    inf = informe()
     victima = tmp_path / "victima"
     victima.write_text("no tocar")
-    enlace = tmp_path / "r"
-    enlace.symlink_to(victima)
-    generar({}, str(enlace))
+    (tmp_path / ghostcheck.nombre_reporte(inf, formato)).symlink_to(victima)
+    _, errores = ghostcheck.guardar_reportes(inf, str(tmp_path), [formato])
+    assert errores
     assert victima.read_text() == "no tocar"
 
 

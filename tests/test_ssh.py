@@ -15,7 +15,7 @@ def ssh_dir(etc):
 
 
 def riesgos(r: dict) -> dict[str, str]:
-    return {h["directiva"]: h["valor"] for h in r["directivas_riesgo"]}
+    return {h["directiva"]: h["valor"] for h in r.datos["directivas_riesgo"]}
 
 
 def escribir(ssh_dir, texto: str) -> None:
@@ -28,7 +28,7 @@ def test_gana_el_primer_valor_como_en_sshd(ssh_dir):
     escribir(ssh_dir, "PermitRootLogin no\nPermitRootLogin yes\nPasswordAuthentication no\n")
     r = ghostcheck.auditar_ssh()
     assert "PermitRootLogin" not in riesgos(r)
-    assert "PermitRootLogin no" in r["directivas_seguras"]
+    assert "PermitRootLogin no" in r.datos["directivas_seguras"]
 
 
 def test_sintaxis_clave_igual_valor(ssh_dir):
@@ -51,9 +51,9 @@ def test_directivas_en_bloque_match_son_condicionales(ssh_dir):
     ))
     r = ghostcheck.auditar_ssh()
     assert riesgos(r) == {}
-    assert {c["directiva"] for c in r["directivas_condicionales"]} == {"X11Forwarding", "PermitRootLogin"}
-    assert {h["codigo"] for h in r["hallazgos"]} == {"ssh_riesgo_condicional"}
-    assert ghostcheck._calcular_nivel_riesgo({"ssh": r}) == "MEDIO"
+    assert {c["directiva"] for c in r.datos["directivas_condicionales"]} == {"X11Forwarding", "PermitRootLogin"}
+    assert set(r.codigos()) == {"ssh_riesgo_condicional"}
+    assert ghostcheck.calcular_nivel_riesgo({"ssh": r}) == "MEDIO"
 
 
 def test_match_all_vuelve_al_contexto_global(ssh_dir):
@@ -65,7 +65,7 @@ def test_valor_por_defecto_de_passwordauthentication(ssh_dir):
     escribir(ssh_dir, "PermitRootLogin no\n")
     r = ghostcheck.auditar_ssh()
     assert riesgos(r) == {"PasswordAuthentication": "yes"}
-    assert r["directivas_riesgo"][0]["origen"] == "valor por defecto de OpenSSH"
+    assert r.datos["directivas_riesgo"][0]["origen"] == "valor por defecto de OpenSSH"
 
 
 def test_include_relativo_multiple_y_anidado(ssh_dir):
@@ -75,7 +75,7 @@ def test_include_relativo_multiple_y_anidado(ssh_dir):
     escribir(ssh_dir, "Include a.conf b.conf\nPasswordAuthentication no\nPermitRootLogin no\n")
     r = ghostcheck.auditar_ssh()
     assert riesgos(r) == {"PermitRootLogin": "yes", "X11Forwarding": "yes"}
-    origen = next(h for h in r["directivas_riesgo"] if h["directiva"] == "PermitRootLogin")
+    origen = next(h for h in r.datos["directivas_riesgo"] if h["directiva"] == "PermitRootLogin")
     assert origen["archivo"] == str(ssh_dir / "nivel2.conf")
     assert origen["linea_num"] == 1
     assert origen["origen"] == f"{ssh_dir / 'nivel2.conf'}:1"
@@ -93,7 +93,7 @@ def test_include_con_comodin_se_procesa_en_orden_alfabetico(ssh_dir):
 def test_include_recursivo_no_cuelga(ssh_dir):
     escribir(ssh_dir, "Include sshd_config\nPasswordAuthentication no\n")
     r = ghostcheck.auditar_ssh()
-    assert any("anidado" in e for e in r["errores"])
+    assert any("anidado" in e for e in r.errores)
 
 
 def test_match_en_fichero_incluido_no_se_propaga(ssh_dir):
@@ -105,13 +105,13 @@ def test_match_en_fichero_incluido_no_se_propaga(ssh_dir):
 def test_varios_puertos(ssh_dir):
     escribir(ssh_dir, "Port 22\nPort 2222\nPasswordAuthentication no\n")
     r = ghostcheck.auditar_ssh()
-    assert r["puertos_ssh"] == ["22", "2222"]
+    assert r.datos["puertos_ssh"] == ["22", "2222"]
 
 
 def test_sin_sshd_config_no_es_hallazgo_ni_error():
     r = ghostcheck.auditar_ssh()
-    assert r["estado"] == "NO_INSTALADO"
-    assert r["hallazgos"] == [] and r["errores"] == []
+    assert r.datos["estado"] == "NO_INSTALADO"
+    assert r.hallazgos == [] and r.errores == []
 
 
 # ── Configuración efectiva con sshd -T ────────────────────────────────────────
@@ -126,21 +126,21 @@ def test_sshd_T_es_la_fuente_principal(ssh_dir, comandos):
     sshd_t(comandos, ssh_dir, "port 22\npermitrootlogin no\npasswordauthentication no\n"
                               "permitemptypasswords no\nx11forwarding no\n")
     r = ghostcheck.auditar_ssh()
-    assert r["fuente"] == "sshd -T"
+    assert r.datos["fuente"] == "sshd -T"
     assert riesgos(r) == {}
 
 
 def test_sshd_T_localiza_fichero_y_linea(ssh_dir, comandos):
     escribir(ssh_dir, "# comentario\nPermitRootLogin yes\n")
     sshd_t(comandos, ssh_dir, "port 22\npermitrootlogin yes\npasswordauthentication no\n")
-    h = ghostcheck.auditar_ssh()["directivas_riesgo"][0]
+    h = ghostcheck.auditar_ssh().datos["directivas_riesgo"][0]
     assert h["origen"] == f"{ssh_dir / 'sshd_config'}:2"
 
 
 def test_sshd_T_valor_implicito(ssh_dir, comandos):
     escribir(ssh_dir, "PermitRootLogin no\n")
     sshd_t(comandos, ssh_dir, "port 22\npermitrootlogin no\npasswordauthentication yes\n")
-    h = ghostcheck.auditar_ssh()["directivas_riesgo"][0]
+    h = ghostcheck.auditar_ssh().datos["directivas_riesgo"][0]
     assert h["directiva"] == "PasswordAuthentication"
     assert "sshd -T" in h["origen"]
 
@@ -156,5 +156,5 @@ def test_si_sshd_T_falla_se_usa_el_analisis_de_ficheros(ssh_dir, comandos):
     comandos.registrar(["sshd", "-T", "-f", str(ssh_dir / "sshd_config")],
                        codigo=1, stderr="sshd: no hostkeys available -- exiting.")
     r = ghostcheck.auditar_ssh()
-    assert r["fuente"] == "análisis de ficheros"
+    assert r.datos["fuente"] == "análisis de ficheros"
     assert riesgos(r) == {"PermitRootLogin": "yes"}
