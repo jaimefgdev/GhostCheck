@@ -51,22 +51,22 @@ def test_lineas_ajenas_no_cuentan_como_paquetes():
 def test_pendientes_agrupados_por_paquete(comandos):
     comandos.registrar(CMD, stdout=DNF4)
     r = ghostcheck.auditar_actualizaciones()
-    assert r["estado"] == "ACTUALIZACIONES_PENDIENTES"
-    assert r["total_pendientes"] == 3
-    assert r["severidades"] == {"Moderate": 2, "Important": 1, "Critical": 1}
-    assert [h["codigo"] for h in r["hallazgos"]] == ["actualizaciones_seguridad"]
+    assert r.datos["estado"] == "ACTUALIZACIONES_PENDIENTES"
+    assert r.datos["total_pendientes"] == 3
+    assert r.datos["severidades"] == {"Moderate": 2, "Important": 1, "Critical": 1}
+    assert r.codigos() == ["actualizaciones_seguridad"]
 
 
 def test_sin_pendientes(comandos):
     comandos.registrar(CMD, stdout="")
     r = ghostcheck.auditar_actualizaciones()
-    assert r["estado"] == "ACTUALIZADO" and r["ok"] is True
+    assert r.datos["estado"] == "ACTUALIZADO" and r.ok is True
 
 
 def test_modo_offline_usa_solo_cache(comandos):
     comandos.registrar(["dnf", "-q", "-C", "updateinfo", "list", "--security"], stdout="")
     r = ghostcheck.auditar_actualizaciones(offline=True)
-    assert r["estado"] == "ACTUALIZADO"
+    assert r.datos["estado"] == "ACTUALIZADO"
     assert comandos.ejecutados == [["dnf", "-q", "-C", "updateinfo", "list", "--security"]]
 
 
@@ -77,9 +77,9 @@ def test_modo_offline_usa_solo_cache(comandos):
 def test_errores_de_dnf_no_son_hallazgos(comandos, respuesta, estado):
     comandos.registrar(CMD, **respuesta)
     r = ghostcheck.auditar_actualizaciones()
-    assert r["estado"] == estado
-    assert r["hallazgos"] == [] and r["errores"]
-    assert ghostcheck._calcular_nivel_riesgo({"actualizaciones": r}) == "BAJO"
+    assert r.datos["estado"] == estado
+    assert r.hallazgos == [] and r.errores
+    assert ghostcheck.calcular_nivel_riesgo({"actualizaciones": r}) == "BAJO"
 
 
 def test_comandos_se_ejecutan_con_locale_c(comandos):
