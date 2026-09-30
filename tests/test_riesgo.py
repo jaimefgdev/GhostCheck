@@ -5,14 +5,11 @@ from __future__ import annotations
 import pytest
 
 import ghostcheck
+from conftest import informe, resultado
 
 
-def con(*codigos: str, errores: tuple[str, ...] = ()) -> dict:
-    modulo = {"hallazgos": [], "advertencias": [], "errores": list(errores)}
-    for c in codigos:
-        modulo["hallazgos"].append({"codigo": c, "severidad": ghostcheck.SEVERIDADES[c], "mensaje": c})
-        modulo["advertencias"].append(c)
-    return modulo
+def con(*codigos: str, errores: tuple[str, ...] = (), nombre: str = "ssh") -> ghostcheck.ResultadoModulo:
+    return resultado(nombre, *codigos, errores=errores)
 
 
 @pytest.mark.parametrize("codigos, nivel", [
@@ -28,12 +25,13 @@ def con(*codigos: str, errores: tuple[str, ...] = ()) -> dict:
     (("usuario_uid0_no_root", "puertos_no_esenciales"), "CRÍTICO"),
 ])
 def test_tabla_de_severidades(codigos, nivel):
-    assert ghostcheck._calcular_nivel_riesgo({"ssh": con(*codigos)}) == nivel
+    assert ghostcheck.calcular_nivel_riesgo({"ssh": con(*codigos)}) == nivel
 
 
 def test_nivel_es_el_maximo_entre_modulos():
-    res = {"selinux": con("selinux_permissive"), "firewall": con("firewall_inactivo")}
-    assert ghostcheck._calcular_nivel_riesgo(res) == "ALTO"
+    res = {"selinux": con("selinux_permissive", nombre="selinux"),
+           "firewall": con("firewall_inactivo", nombre="firewall")}
+    assert ghostcheck.calcular_nivel_riesgo(res) == "ALTO"
 
 
 def test_todos_los_codigos_tienen_nivel_valido():
@@ -41,22 +39,25 @@ def test_todos_los_codigos_tienen_nivel_valido():
 
 
 def test_errores_no_suben_el_nivel_pero_marcan_incompleta():
-    res = {"actualizaciones": con(errores=("timeout",)), "usuarios": con(errores=("shadow",))}
-    assert ghostcheck._calcular_nivel_riesgo(res) == "BAJO"
-    assert ghostcheck._comprobaciones_no_realizadas(res) == ["[usuarios] shadow", "[actualizaciones] timeout"]
+    res = {"usuarios": con(errores=("shadow",), nombre="usuarios"),
+           "actualizaciones": con(errores=("timeout",), nombre="actualizaciones")}
+    assert ghostcheck.calcular_nivel_riesgo(res) == "BAJO"
+    assert ghostcheck.comprobaciones_no_realizadas(res) == ["[usuarios] shadow", "[actualizaciones] timeout"]
 
 
-def test_reporte_txt_indica_auditoria_incompleta(tmp_path):
-    res = {"actualizaciones": con(errores=("timeout de dnf",))}
-    ruta = ghostcheck.generar_reporte_txt(res, str(tmp_path / "r.txt"))
-    texto = open(ruta, encoding="utf-8").read()
+def test_reporte_txt_indica_auditoria_incompleta():
+    texto = ghostcheck.renderizar_txt(informe(con(errores=("timeout de dnf",), nombre="actualizaciones")))
     assert "INCOMPLETA" in texto
     assert "No comprobado: timeout de dnf" in texto
     assert "Nivel de riesgo global : BAJO" in texto
 
 
-def test_reporte_html_indica_auditoria_incompleta(tmp_path):
-    res = {"usuarios": con(errores=("sin shadow",))}
-    ruta = ghostcheck.generar_reporte_html(res, str(tmp_path / "r.html"))
-    texto = open(ruta, encoding="utf-8").read()
+def test_reporte_html_indica_auditoria_incompleta():
+    texto = ghostcheck.renderizar_html(informe(con(errores=("sin shadow",), nombre="usuarios")))
     assert "INCOMPLETA" in texto and "No comprobado: sin shadow" in texto
+
+
+def test_sin_root_la_auditoria_es_incompleta():
+    inf = informe(con(), como_root=False)
+    assert not inf.completa
+    assert "sin privilegios" in inf.no_realizadas[0]

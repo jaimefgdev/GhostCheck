@@ -81,7 +81,8 @@ def test_ejecucion_completa_solo_usa_comandos_de_lectura(monkeypatch, tmp_path, 
     salida = tmp_path / "reportes"
     salida.mkdir()
 
-    ghostcheck.main(["--output-dir", str(salida)])
+    codigo = ghostcheck.main(["--output-dir", str(salida)])
+    assert codigo == 1  # MEDIO: puerto 8080 no esencial
 
     usados = {c[0] for c in comandos.ejecutados}
     assert usados <= {"getenforce", "sestatus", "systemctl", "firewall-cmd", "dnf", "hostname", "sshd"}
@@ -93,6 +94,4 @@ def test_ejecucion_completa_solo_usa_comandos_de_lectura(monkeypatch, tmp_path, 
 
 
 def test_output_dir_inexistente_termina_con_error(tmp_path):
-    with pytest.raises(SystemExit) as exc:
-        ghostcheck.main(["--output-dir", str(tmp_path / "no-existe")])
-    assert exc.value.code == 2
+    assert ghostcheck.main(["--output-dir", str(tmp_path / "no-existe")]) == ghostcheck.SALIDA_ERROR
