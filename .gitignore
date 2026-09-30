@@ -1,3 +1,13 @@
-__pycache__/ 
-venv/ 
-.vscode/ 
+__pycache__/
+venv/
+.venv/
+.vscode/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# Reportes generados por GhostCheck (contienen datos sensibles del servidor)
+auditoria_servidor_*
