@@ -39,5 +39,5 @@ sed -i '1s|^#!.*|#!%{__python3} -s|' %{buildroot}%{_bindir}/ghostcheck
 %{_bindir}/ghostcheck
 
 %changelog
-* Wed Sep 30 2026 jaimefg1888 - 1.0.0-1
+* Wed Sep 30 2026 jaimefgdev - 1.0.0-1
 - Primera versión empaquetada.
