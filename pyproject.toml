@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ghostcheck"
+dynamic = ["version"]
+description = "Auditoría de seguridad en modo DRY-RUN para servidores Linux / RHEL"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "Unlicense"
+license-files = ["LICENSE"]
+authors = [{ name = "jaimefg1888" }]
+keywords = ["security", "audit", "rhel", "selinux", "firewalld", "ssh", "dry-run"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Security",
+    "Topic :: System :: Systems Administration",
+]
+
+[project.urls]
+Homepage = "https://github.com/jaimefgdev/ghostcheck"
+Issues = "https://github.com/jaimefgdev/ghostcheck/issues"
+
+[project.scripts]
+ghostcheck = "ghostcheck:main"
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff", "mypy"]
+
+[tool.setuptools]
+py-modules = ["ghostcheck"]
+
+[tool.setuptools.dynamic]
+version = { attr = "ghostcheck.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"
+
+[tool.ruff]
+target-version = "py39"
+
+[tool.ruff.lint]
+# Reglas fijadas explícitamente: el conjunto por defecto cambia entre versiones de ruff.
+select = ["E4", "E7", "E9", "F"]
+
+[tool.mypy]
+python_version = "3.9"
+files = ["ghostcheck.py"]

@@ -9,14 +9,54 @@ permissions:
   contents: read
 
 jobs:
-  tests:
+  lint:
+    name: Lint (ruff + mypy)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-      - name: Instalar pytest
-        run: python -m pip install pytest
+          python-version: "3.13"
+      - run: python -m pip install ruff mypy
+      - run: ruff check .
+      - run: mypy
+
+  tests:
+    name: Tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install pytest
       - name: Ejecutar tests (sin tocar el sistema real)
         run: python -m pytest -v
+
+  paquete:
+    name: Paquete Python (wheel + sdist)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - run: python -m pip install build
+      - run: python -m build
+      - name: Instalar el wheel y ejecutar el comando
+        run: |
+          python -m pip install dist/*.whl
+          ghostcheck --version
+          ghostcheck --help
+
+  rocky9:
+    name: Rocky Linux 9 (integración real, DRY-RUN verificado, RPM)
+    runs-on: ubuntu-latest
+    container: rockylinux:9
+    steps:
+      - uses: actions/checkout@v4
+      - run: ci/rocky9.sh
