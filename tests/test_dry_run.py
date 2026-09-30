@@ -13,7 +13,11 @@ from conftest import COMANDOS_SOLO_LECTURA
 COMANDOS_PELIGROSOS = [
     ["rm", "-rf", "/"],
     ["dnf", "update", "--security", "-y"],
-    ["dnf", "check-update", "--security", "-y"],
+    ["dnf", "-q", "updateinfo", "list", "--security", "-y"],
+    ["dnf", "check-update", "--security"],
+    ["sshd", "-t"],
+    ["sshd", "-T", "-f", "/etc/ssh/sshd_config;id"],
+    ["ufw", "app", "info", "x;reboot"],
     ["firewall-cmd", "--permanent", "--remove-port=8080/tcp"],
     ["firewall-cmd", "--list-ports", "--zone=public;reboot"],
     ["systemctl", "restart", "sshd"],
@@ -69,10 +73,9 @@ def test_ejecucion_completa_solo_usa_comandos_de_lectura(monkeypatch, tmp_path, 
     monkeypatch.setattr(ghostcheck.os, "getuid", lambda: 0)
     comandos.registrar(["getenforce"], stdout="Enforcing")
     comandos.registrar(["sestatus"], stdout="Loaded policy name:             targeted")
-    comandos.registrar(["systemctl", "is-active", "firewalld"], stdout="active")
-    comandos.registrar(["firewall-cmd", "--list-ports", "--zone=public"], stdout="8080/tcp")
-    comandos.registrar(["firewall-cmd", "--list-services", "--zone=public"], stdout="ssh")
-    comandos.registrar(["dnf", "check-update", "--security"], codigo=0)
+    comandos.firewalld_activo(puertos="8080/tcp", servicios="ssh")
+    comandos.registrar(["firewall-cmd", "--info-service=ssh"], stdout="ssh\n  ports: 22/tcp")
+    comandos.registrar(["dnf", "-q", "updateinfo", "list", "--security"], codigo=0)
     comandos.registrar(["hostname", "-f"], stdout="srv.example.test")
     (etc / "passwd").write_text("root:x:0:0:root:/root:/bin/bash\n")
     salida = tmp_path / "reportes"
@@ -81,7 +84,7 @@ def test_ejecucion_completa_solo_usa_comandos_de_lectura(monkeypatch, tmp_path, 
     ghostcheck.main(["--output-dir", str(salida)])
 
     usados = {c[0] for c in comandos.ejecutados}
-    assert usados <= {"getenforce", "sestatus", "systemctl", "firewall-cmd", "dnf", "hostname"}
+    assert usados <= {"getenforce", "sestatus", "systemctl", "firewall-cmd", "dnf", "hostname", "sshd"}
     reportes = sorted(salida.iterdir())
     assert [p.suffix for p in reportes] == [".html", ".txt"]
     for p in reportes:

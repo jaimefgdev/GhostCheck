@@ -37,24 +37,80 @@ from typing import Optional
 # CONSTANTES GLOBALES
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Puertos considerados esenciales (SSH, HTTP, HTTPS)
+# Puertos considerados esenciales (SSH, HTTP, HTTPS). Solo cuentan en TCP.
+# Los puertos en los que escucha sshd se añaden a esta lista en tiempo de ejecución.
 PUERTOS_ESENCIALES: set[str] = {"22", "80", "443"}
 
 # Rutas clave del sistema
 RUTA_PASSWD:    str = "/etc/passwd"
 RUTA_SHADOW:    str = "/etc/shadow"
 RUTA_SSHD_CFG: str = "/etc/ssh/sshd_config"
+RUTA_SELINUX_CFG: str = "/etc/selinux/config"
 
-# Directivas de sshd_config consideradas de alto riesgo.
-# Formato: { "directiva": "valor_peligroso" }
-# Solo se marcan cuando están activas (sin comentar) y con el valor peligroso.
-SSHD_DIRECTIVAS_RIESGO: dict[str, str] = {
-    "PermitRootLogin":        "yes",
-    "PasswordAuthentication": "yes",   # riesgo si se prefiere solo clave pública
-    "PermitEmptyPasswords":   "yes",   # riesgo crítico
-    "X11Forwarding":          "yes",   # superficie de ataque innecesaria
-    "Protocol":               "1",     # SSHv1 obsoleto y vulnerable
+# ─────────────────────────────────────────────────────────────────────────────
+# NIVELES DE RIESGO — Tabla explícita hallazgo → severidad
+# ─────────────────────────────────────────────────────────────────────────────
+# El nivel de riesgo global es la severidad MÁXIMA de los hallazgos.
+# Las comprobaciones que no se pudieron realizar (errores) NO suben el nivel:
+# marcan la auditoría como INCOMPLETA.
+
+NIVELES_RIESGO: tuple[str, ...] = ("BAJO", "MEDIO", "ALTO", "CRÍTICO")
+
+SEVERIDADES: dict[str, str] = {
+    # CRÍTICO — exposición directa a nivel root: actuar de inmediato
+    "usuario_uid0_no_root":        "CRÍTICO",
+    "cuenta_sin_contrasena":       "CRÍTICO",
+    "ssh_permit_root_login":       "CRÍTICO",
+    "ssh_permit_empty_passwords":  "CRÍTICO",
+    # ALTO — una capa de defensa principal falla
+    "selinux_deshabilitado":       "ALTO",
+    "firewall_ausente":            "ALTO",
+    "firewall_inactivo":           "ALTO",
+    "actualizaciones_seguridad":   "ALTO",
+    "ssh_password_authentication": "ALTO",
+    "ssh_protocol_1":              "ALTO",
+    # MEDIO — debilidades que conviene revisar
+    "selinux_permissive":          "MEDIO",
+    "selinux_no_persistente":      "MEDIO",
+    "selinux_no_disponible":       "MEDIO",
+    "puertos_no_esenciales":       "MEDIO",
+    "firewall_reglas_a_revisar":   "MEDIO",
+    "ssh_x11_forwarding":          "MEDIO",
+    "ssh_riesgo_condicional":      "MEDIO",
 }
+
+# Módulos cuyos resultados se agregan en el resumen y el nivel de riesgo
+MODULOS: tuple[str, ...] = ("selinux", "firewall", "usuarios", "ssh", "actualizaciones")
+
+# Directivas de sshd_config consideradas de riesgo.
+# Formato: { "directiva_en_minúsculas": (nombre, valor_peligroso, código_hallazgo) }
+SSHD_DIRECTIVAS_RIESGO: dict[str, tuple[str, str, str]] = {
+    "permitrootlogin":        ("PermitRootLogin",        "yes", "ssh_permit_root_login"),
+    "passwordauthentication": ("PasswordAuthentication", "yes", "ssh_password_authentication"),
+    "permitemptypasswords":   ("PermitEmptyPasswords",   "yes", "ssh_permit_empty_passwords"),
+    "x11forwarding":          ("X11Forwarding",          "yes", "ssh_x11_forwarding"),
+    "protocol":               ("Protocol",               "1",   "ssh_protocol_1"),
+}
+
+SSHD_DESCRIPCIONES: dict[str, str] = {
+    "permitrootlogin":        "Permite login directo como root vía SSH — vector de ataque primario.",
+    "passwordauthentication": "Permite autenticación por contraseña — vulnerable a fuerza bruta.",
+    "permitemptypasswords":   "Permite login SSH sin contraseña — riesgo CRÍTICO.",
+    "x11forwarding":          "Reenvío X11 activo — aumenta la superficie de ataque.",
+    "protocol":               "SSHv1 habilitado — protocolo obsoleto con vulnerabilidades conocidas.",
+}
+
+# Valores por defecto de OpenSSH cuando la directiva no aparece en la
+# configuración (solo se usan si `sshd -T` no está disponible).
+SSHD_VALORES_DEFECTO: dict[str, str] = {
+    "permitrootlogin":        "prohibit-password",
+    "passwordauthentication": "yes",
+    "permitemptypasswords":   "no",
+    "x11forwarding":          "no",
+}
+
+# Profundidad máxima de Include anidados (la misma que usa sshd)
+SSHD_MAX_PROFUNDIDAD_INCLUDE: int = 16
 
 # Lista blanca de comandos de SOLO LECTURA que GhostCheck puede ejecutar.
 # Cada entrada es una plantilla: una tupla de expresiones regulares que deben
@@ -65,12 +121,20 @@ COMANDOS_PERMITIDOS: tuple[tuple[str, ...], ...] = (
     ("getenforce",),
     ("sestatus",),
     ("systemctl", "is-active", "firewalld"),
-    ("firewall-cmd", "--list-ports",    r"--zone=[\w.-]+"),
-    ("firewall-cmd", "--list-services", r"--zone=[\w.-]+"),
+    ("firewall-cmd", "--get-default-zone"),
+    ("firewall-cmd", "--get-active-zones"),
+    ("firewall-cmd", r"--list-(?:ports|services|rich-rules|forward-ports)", r"--zone=[\w.-]+"),
+    ("firewall-cmd", r"--info-service=[\w.-]+"),
     ("ufw", "status", "verbose"),
-    ("dnf", "check-update", "--security"),
+    ("ufw", "app", "info", r"[\w .+-]+"),
+    ("sshd", "-T", "-f", r"/[\w./-]+"),
+    ("dnf", "-q", "updateinfo", "list", "--security"),
+    ("dnf", "-q", "-C", "updateinfo", "list", "--security"),
     ("hostname", "-f"),
 )
+
+# Entorno de los comandos: locale C para que la salida no dependa del idioma
+ENTORNO_COMANDOS: dict[str, str] = {**os.environ, "LC_ALL": "C", "LANG": "C"}
 
 # Marca de tiempo para los nombres de fichero de reporte
 HOY: str = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -188,6 +252,7 @@ def ejecutar_comando(
             capture_output=True,
             text=True,
             errors="replace",
+            env=ENTORNO_COMANDOS,
             timeout=timeout
         )
         return resultado.returncode, resultado.stdout.strip(), resultado.stderr.strip()
@@ -201,43 +266,90 @@ def ejecutar_comando(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# UTILIDAD — Registro de hallazgos y de comprobaciones no realizadas
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _nuevo_resultado(**campos) -> dict:
+    """Crea el diccionario base de resultados de un módulo."""
+    return {**campos, "hallazgos": [], "advertencias": [], "errores": [], "ok": True}
+
+
+def _registrar_hallazgo(resultado: dict, codigo: str, mensaje: str) -> None:
+    """
+    Registra un hallazgo de seguridad. Su severidad sale de la tabla
+    SEVERIDADES, que es la única fuente del nivel de riesgo global.
+    """
+    resultado["hallazgos"].append(
+        {"codigo": codigo, "severidad": SEVERIDADES[codigo], "mensaje": mensaje}
+    )
+    resultado["advertencias"].append(mensaje)
+    resultado["ok"] = False
+
+
+def _registrar_error(resultado: dict, mensaje: str) -> None:
+    """
+    Registra una comprobación que NO se pudo realizar. No sube el nivel de
+    riesgo, pero marca la auditoría como INCOMPLETA.
+    """
+    resultado["errores"].append(mensaje)
+    resultado["ok"] = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # [2] AUDITORÍA DE SELINUX
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _leer_modo_selinux_persistente() -> Optional[str]:
+    """
+    Devuelve el modo configurado en /etc/selinux/config (el que se aplicará
+    tras reiniciar), en minúsculas, o None si no se puede determinar.
+    """
+    try:
+        with open(RUTA_SELINUX_CFG, "r", encoding="utf-8", errors="replace") as fh:
+            for linea in fh:
+                coincidencia = re.match(r"\s*SELINUX\s*=\s*(\w+)", linea)
+                if coincidencia:
+                    return coincidencia.group(1).lower()
+    except OSError:
+        return None
+    return None
+
+
 def auditar_selinux() -> dict:
     """
-    Comprueba el estado actual de SELinux usando `getenforce` y `sestatus`.
+    Comprueba el estado de SELinux: modo en ejecución (`getenforce`),
+    política cargada (`sestatus`) y modo persistente (/etc/selinux/config).
 
     Returns:
-        Diccionario con estado, modo, política activa y lista de advertencias.
+        Diccionario con estado, modo, política, hallazgos y errores.
     """
     print("=" * 64)
     print("  [2] AUDITORÍA DE SELINUX")
     print("=" * 64)
 
-    resultado: dict = {
-        "herramienta": "SELinux",
-        "estado":      "DESCONOCIDO",
-        "modo":        None,
-        "politica":    None,
-        "advertencias": [],
-        "ok":          False,
-    }
+    resultado = _nuevo_resultado(
+        herramienta="SELinux",
+        estado="DESCONOCIDO",
+        modo=None,
+        modo_persistente=None,
+        politica=None,
+    )
 
     codigo, stdout, stderr = ejecutar_comando(["getenforce"])
 
     if codigo == -1:
         adv = "SELinux no está instalado o no está disponible en este sistema."
-        resultado["advertencias"].append(adv)
+        _registrar_hallazgo(resultado, "selinux_no_disponible", adv)
         resultado["estado"] = "NO_DISPONIBLE"
         print(f"  [⚠] {adv}")
         print()
         return resultado
 
     if codigo != 0:
-        adv = f"Error al ejecutar getenforce: {stderr}"
-        resultado["advertencias"].append(adv)
-        print(f"  [✘] {adv}")
+        err = f"Error al ejecutar getenforce: {stderr or stdout}"
+        _registrar_error(resultado, err)
+        resultado["estado"] = "ERROR"
+        print(f"  [?] {err}")
         print()
         return resultado
 
@@ -249,33 +361,42 @@ def auditar_selinux() -> dict:
     if codigo_s == 0:
         for linea in stdout_s.splitlines():
             if "Loaded policy name" in linea:
-                resultado["politica"] = linea.split(":")[1].strip()
+                resultado["politica"] = linea.split(":", 1)[1].strip()
+
+    persistente = _leer_modo_selinux_persistente()
+    resultado["modo_persistente"] = persistente
 
     if modo == "Enforcing":
         resultado["estado"] = "OK"
-        resultado["ok"]     = True
-        print(f"  [✔] SELinux está en modo: Enforcing")
-        print(f"  [i] Política cargada: {resultado.get('politica', 'N/A')}")
+        print("  [✔] SELinux está en modo: Enforcing")
+        print(f"  [i] Política cargada: {resultado['politica'] or 'N/A'}")
+        if persistente and persistente != "enforcing":
+            adv = (
+                f"SELinux está en Enforcing pero {RUTA_SELINUX_CFG} indica "
+                f"SELINUX={persistente}: el cambio NO sobrevivirá a un reinicio."
+            )
+            _registrar_hallazgo(resultado, "selinux_no_persistente", adv)
+            print(f"  [⚠] {adv}")
 
     elif modo == "Permissive":
         adv = "SELinux en modo PERMISSIVE: las políticas se registran pero NO se aplican."
         resultado["estado"] = "ADVERTENCIA"
-        resultado["advertencias"].append(adv)
+        _registrar_hallazgo(resultado, "selinux_permissive", adv)
         print(f"  [⚠] {adv}")
-        print( "      Recomendación: Cambiar a Enforcing en /etc/selinux/config")
+        print(f"      Recomendación: Cambiar a Enforcing en {RUTA_SELINUX_CFG}")
 
     elif modo == "Disabled":
         adv = "SELinux DESHABILITADO: el sistema carece de control de acceso obligatorio (MAC)."
-        resultado["estado"] = "CRÍTICO"
-        resultado["advertencias"].append(adv)
+        resultado["estado"] = "DESHABILITADO"
+        _registrar_hallazgo(resultado, "selinux_deshabilitado", adv)
         print(f"  [✘] {adv}")
-        print( "      Recomendación: Habilitar SELinux y reiniciar el sistema.")
+        print("      Recomendación: Habilitar SELinux y reiniciar el sistema.")
 
     else:
-        adv = f"Estado de SELinux desconocido: '{modo}'"
+        err = f"Estado de SELinux desconocido: '{modo}'"
         resultado["estado"] = "DESCONOCIDO"
-        resultado["advertencias"].append(adv)
-        print(f"  [?] {adv}")
+        _registrar_error(resultado, err)
+        print(f"  [?] {err}")
 
     print()
     return resultado
@@ -285,112 +406,245 @@ def auditar_selinux() -> dict:
 # [3] GESTIÓN DE FIREWALL
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _auditar_firewalld() -> dict:
-    """Audita el firewall mediante firewalld (RHEL / CentOS / Fedora / Rocky)."""
-    resultado: dict = {
-        "herramienta":       "firewalld",
-        "activo":            False,
-        "puertos_abiertos":  [],
-        "puertos_a_revisar": [],
-        "advertencias":      [],
-        "ok":                False,
-    }
+# Respaldo si `firewall-cmd --info-service` no responde
+MAPA_SERVICIOS_FIREWALLD: dict[str, list[str]] = {
+    "ssh": ["22/tcp"], "http": ["80/tcp"], "https": ["443/tcp"],
+    "ftp": ["21/tcp"], "smtp": ["25/tcp"], "dns": ["53/tcp", "53/udp"],
+    "mysql": ["3306/tcp"], "postgresql": ["5432/tcp"], "cockpit": ["9090/tcp"],
+    "dhcpv6-client": ["546/udp"],
+}
+
+# Respaldo si `ufw app info` no responde. Se evalúan en orden, así que las
+# variantes 'full' (80+443) van antes que 'http' y 'https' por separado.
+PERFILES_APP_UFW: list[tuple[str, list[str]]] = [
+    ("nginx full",    ["80/tcp", "443/tcp"]),
+    ("apache full",   ["80/tcp", "443/tcp"]),
+    ("nginx https",   ["443/tcp"]),
+    ("nginx http",    ["80/tcp"]),
+    ("apache secure", ["443/tcp"]),
+    ("apache",        ["80/tcp"]),
+    ("openssh",       ["22/tcp"]),
+]
+
+
+def _normalizar_puertos(especificacion: str) -> list[str]:
+    """
+    Convierte una especificación de puertos en una lista normalizada
+    "puerto/protocolo" (o solo "puerto" si no indica protocolo).
+
+    Ejemplos:
+        "8080/tcp"      → ["8080/tcp"]
+        "80,443/tcp"    → ["80/tcp", "443/tcp"]
+        "6000:6007/tcp" → ["6000-6007/tcp"]
+        "53"            → ["53"]
+    """
+    numeros, _, protocolo = especificacion.strip().partition("/")
+    sufijo = f"/{protocolo.lower()}" if protocolo else ""
+    return [
+        n.strip().replace(":", "-") + sufijo
+        for n in numeros.split(",")
+        if n.strip()
+    ]
+
+
+def _es_puerto_esencial(puerto: str, esenciales: set[str]) -> bool:
+    """Un puerto es esencial si su número está en la lista y es TCP (o sin protocolo)."""
+    numero, _, protocolo = puerto.partition("/")
+    return numero in esenciales and protocolo in ("", "tcp")
+
+
+def _zonas_firewalld(resultado: dict) -> list[str]:
+    """Zona por defecto + zonas activas (con interfaces o fuentes asignadas)."""
+    zonas: list[str] = []
+    codigo_d, stdout_d, _ = ejecutar_comando(["firewall-cmd", "--get-default-zone"])
+    if codigo_d == 0 and stdout_d:
+        zonas.append(stdout_d.split()[0])
+
+    codigo_a, stdout_a, _ = ejecutar_comando(["firewall-cmd", "--get-active-zones"])
+    if codigo_a == 0:
+        for linea in stdout_a.splitlines():
+            # Los nombres de zona no van indentados; sus propiedades sí.
+            if linea and not linea[0].isspace():
+                zona = linea.split()[0]
+                if zona not in zonas:
+                    zonas.append(zona)
+
+    if not zonas:
+        _registrar_error(
+            resultado,
+            "No se pudieron obtener las zonas de firewalld; se audita solo la zona 'public'.",
+        )
+        zonas = ["public"]
+    return zonas
+
+
+def _puertos_servicio_firewalld(servicio: str) -> Optional[list[str]]:
+    """Puertos de un servicio de firewalld según `firewall-cmd --info-service`."""
+    codigo, stdout, _ = ejecutar_comando(["firewall-cmd", f"--info-service={servicio}"])
+    if codigo == 0:
+        for linea in stdout.splitlines():
+            linea = linea.strip()
+            if linea.startswith("ports:"):
+                puertos: list[str] = []
+                for especificacion in linea[len("ports:"):].split():
+                    puertos.extend(_normalizar_puertos(especificacion))
+                return puertos
+    return MAPA_SERVICIOS_FIREWALLD.get(servicio)
+
+
+def _auditar_firewalld(esenciales: set[str]) -> dict:
+    """Audita firewalld en todas las zonas activas (RHEL / CentOS / Fedora / Rocky)."""
+    resultado = _nuevo_resultado(
+        herramienta="firewalld",
+        activo=False,
+        zonas=[],
+        puertos_abiertos=[],
+        puertos_a_revisar=[],
+        detalle_puertos=[],   # list[dict]: zona, puerto, origen (puerto | servicio)
+    )
 
     codigo, stdout, _ = ejecutar_comando(["systemctl", "is-active", "firewalld"])
     if codigo != 0 or stdout != "active":
-        resultado["advertencias"].append("firewalld no está activo. El sistema puede estar expuesto.")
+        _registrar_hallazgo(
+            resultado, "firewall_inactivo",
+            "firewalld no está activo. El sistema puede estar expuesto.",
+        )
         print("  [✘] firewalld NO está activo.")
         return resultado
 
     resultado["activo"] = True
     print("  [✔] firewalld está activo.")
 
-    codigo_p, stdout_p, _ = ejecutar_comando(["firewall-cmd", "--list-ports",    "--zone=public"])
-    codigo_s, stdout_s, _ = ejecutar_comando(["firewall-cmd", "--list-services", "--zone=public"])
+    zonas = _zonas_firewalld(resultado)
+    resultado["zonas"] = zonas
+    print(f"  [i] Zonas auditadas: {', '.join(zonas)}")
 
-    puertos_raw:   list[str] = stdout_p.split() if stdout_p else []
-    servicios_raw: list[str] = stdout_s.split() if stdout_s else []
+    for zona in zonas:
+        listas: dict[str, list[str]] = {}
+        for tipo in ("ports", "services", "rich-rules", "forward-ports"):
+            codigo_l, stdout_l, stderr_l = ejecutar_comando(
+                ["firewall-cmd", f"--list-{tipo}", f"--zone={zona}"]
+            )
+            if codigo_l != 0:
+                _registrar_error(
+                    resultado, f"Zona {zona}: no se pudo obtener --list-{tipo}: {stderr_l or codigo_l}"
+                )
+                listas[tipo] = []
+            elif tipo == "rich-rules":
+                listas[tipo] = [r for r in stdout_l.splitlines() if r.strip()]
+            else:
+                listas[tipo] = stdout_l.split()
 
-    mapa_servicios: dict[str, str] = {
-        "ssh": "22", "http": "80", "https": "443",
-        "ftp": "21", "smtp": "25", "dns": "53",
-        "mysql": "3306", "postgresql": "5432",
-    }
-    puertos_desde_servicios = [mapa_servicios[s] for s in servicios_raw if s in mapa_servicios]
+        for especificacion in listas["ports"]:
+            for puerto in _normalizar_puertos(especificacion):
+                resultado["detalle_puertos"].append(
+                    {"zona": zona, "puerto": puerto, "origen": "puerto"}
+                )
 
-    # Normalizar a solo el número (quitar "/tcp", "/udp")
-    todos_puertos: list[str] = list(
-        {p.split("/")[0] for p in puertos_raw} | set(puertos_desde_servicios)
-    )
-    resultado["puertos_abiertos"] = todos_puertos
+        for servicio in listas["services"]:
+            puertos_srv = _puertos_servicio_firewalld(servicio)
+            if puertos_srv is None:
+                _registrar_hallazgo(
+                    resultado, "firewall_reglas_a_revisar",
+                    f"Zona {zona}: no se pudieron resolver los puertos del servicio '{servicio}'.",
+                )
+                continue
+            for puerto in puertos_srv:
+                resultado["detalle_puertos"].append(
+                    {"zona": zona, "puerto": puerto, "origen": f"servicio:{servicio}"}
+                )
 
-    no_esenciales = [p for p in todos_puertos if p not in PUERTOS_ESENCIALES]
-    resultado["puertos_a_revisar"] = no_esenciales
+        if listas["rich-rules"]:
+            _registrar_hallazgo(
+                resultado, "firewall_reglas_a_revisar",
+                f"Zona {zona}: {len(listas['rich-rules'])} regla(s) rich que deben revisarse manualmente.",
+            )
+        if listas["forward-ports"]:
+            _registrar_hallazgo(
+                resultado, "firewall_reglas_a_revisar",
+                f"Zona {zona}: {len(listas['forward-ports'])} redirección(es) de puertos activas.",
+            )
 
-    print(f"  [i] Puertos/Servicios abiertos: {', '.join(todos_puertos) or 'ninguno'}")
-    if servicios_raw:
-        print(f"  [i] Servicios habilitados:      {', '.join(servicios_raw)}")
+    resultado["puertos_abiertos"] = sorted({d["puerto"] for d in resultado["detalle_puertos"]})
+    a_revisar = [
+        d for d in resultado["detalle_puertos"] if not _es_puerto_esencial(d["puerto"], esenciales)
+    ]
+    resultado["puertos_a_revisar"] = sorted({d["puerto"] for d in a_revisar})
 
-    if no_esenciales:
-        msg = f"Puertos no esenciales detectados: {', '.join(no_esenciales)}"
-        resultado["advertencias"].append(msg)
+    print(f"  [i] Puertos abiertos: {', '.join(resultado['puertos_abiertos']) or 'ninguno'}")
+
+    if a_revisar:
+        msg = f"Puertos no esenciales detectados: {', '.join(resultado['puertos_a_revisar'])}"
+        _registrar_hallazgo(resultado, "puertos_no_esenciales", msg)
         print(f"  [⚠] {msg}")
-        print( "      Recomendación (DRY-RUN): evaluar y bloquear con:")
-        for p in no_esenciales:
-            print(f"        firewall-cmd --permanent --remove-port={p}/tcp")
-    else:
-        resultado["ok"] = True
+        print("      Recomendación (DRY-RUN): evaluar y, si procede, cerrar con:")
+        vistos: set[str] = set()
+        for d in a_revisar:
+            if d["origen"].startswith("servicio:"):
+                orden = (
+                    f"firewall-cmd --permanent --zone={d['zona']} "
+                    f"--remove-service={d['origen'].split(':', 1)[1]}"
+                )
+            else:
+                orden = f"firewall-cmd --permanent --zone={d['zona']} --remove-port={d['puerto']}"
+            if orden not in vistos:
+                vistos.add(orden)
+                print(f"        {orden}")
+        print("        firewall-cmd --reload")
+    elif not resultado["hallazgos"]:
         print("  [✔] Solo están abiertos los puertos esenciales.")
+
+    for adv in resultado["advertencias"]:
+        if not adv.startswith("Puertos no esenciales"):
+            print(f"  [⚠] {adv}")
 
     return resultado
 
 
-def _auditar_ufw() -> dict:
+def _puertos_perfil_ufw(perfil: str) -> Optional[list[str]]:
+    """Puertos de un perfil de aplicación UFW (`ufw app info`, con respaldo estático)."""
+    codigo, stdout, _ = ejecutar_comando(["ufw", "app", "info", perfil])
+    if codigo == 0 and "Ports:" in stdout:
+        puertos: list[str] = []
+        for linea in stdout.split("Ports:", 1)[1].splitlines():
+            if linea.strip():
+                puertos.extend(_normalizar_puertos(linea.strip()))
+        if puertos:
+            return puertos
+    perfil_lower = perfil.lower()
+    for fragmento, puertos_fijos in PERFILES_APP_UFW:
+        if fragmento in perfil_lower:
+            return puertos_fijos
+    return None
+
+
+def _auditar_ufw(esenciales: set[str]) -> dict:
     """
     Audita el firewall mediante UFW (Debian / Ubuntu).
 
-    Mejoras sobre la versión original:
-      - Parsea perfiles de aplicación (App Profiles) de 'ufw status verbose'
-        y los resuelve a sus puertos correspondientes.
-      - Los puertos numéricos directos se siguen detectando como antes.
-
-    Tabla de mapeo de perfiles de aplicación:
-      OpenSSH / SSH        → 22
-      Nginx HTTP / Apache  → 80
-      Nginx HTTPS / Apache Secure → 443
-      Nginx Full / Apache Full    → 80, 443
+    Interpreta la tabla de `ufw status verbose` por columnas (To / Action /
+    From) y solo tiene en cuenta reglas de entrada (ALLOW/LIMIT IN):
+      - "22/tcp", "80,443/tcp", "6000:6007/tcp" → puertos normalizados.
+      - "Anywhere" → la regla permite TODO el tráfico desde el origen.
+      - Nombre de perfil ("Nginx Full") → se resuelve con `ufw app info`.
     """
-    # Mapa de perfiles de aplicación UFW → lista de puertos equivalentes.
-    # Las claves son fragmentos de texto en minúsculas presentes en el nombre
-    # del perfil; se evalúan en orden para que 'full' (80+443) tenga prioridad
-    # sobre 'http' y 'https' por separado.
-    PERFILES_APP: list[tuple[str, list[str]]] = [
-        ("nginx full",      ["80", "443"]),
-        ("apache full",     ["80", "443"]),
-        ("nginx http",      ["80"]),
-        ("nginx https",     ["443"]),
-        ("apache secure",   ["443"]),
-        ("apache",          ["80"]),
-        ("openssh",         ["22"]),
-        ("ssh",             ["22"]),
-    ]
+    resultado = _nuevo_resultado(
+        herramienta="ufw",
+        activo=False,
+        puertos_abiertos=[],
+        puertos_a_revisar=[],
+    )
 
-    resultado: dict = {
-        "herramienta":       "ufw",
-        "activo":            False,
-        "puertos_abiertos":  [],
-        "puertos_a_revisar": [],
-        "advertencias":      [],
-        "ok":                False,
-    }
-
-    codigo, stdout, _ = ejecutar_comando(["ufw", "status", "verbose"])
+    codigo, stdout, stderr = ejecutar_comando(["ufw", "status", "verbose"])
     if codigo != 0:
-        resultado["advertencias"].append("No se pudo obtener el estado de UFW.")
+        _registrar_error(resultado, f"No se pudo obtener el estado de UFW: {stderr or codigo}")
+        print("  [?] No se pudo obtener el estado de UFW.")
         return resultado
 
-    if "inactive" in stdout.lower():
-        resultado["advertencias"].append("UFW está INACTIVO. El sistema puede estar expuesto.")
+    if re.search(r"(?im)^status:\s*inactive", stdout):
+        _registrar_hallazgo(
+            resultado, "firewall_inactivo", "UFW está INACTIVO. El sistema puede estar expuesto."
+        )
         print("  [✘] UFW NO está activo.")
         return resultado
 
@@ -398,59 +652,67 @@ def _auditar_ufw() -> dict:
     print("  [✔] UFW está activo.")
 
     puertos_detectados: set[str] = set()
-    perfiles_resueltos: list[str] = []   # para informar qué perfiles se mapearon
-
     for linea in stdout.splitlines():
-        linea_upper = linea.upper()
-        if "ALLOW" not in linea_upper:
+        columnas = re.split(r"\s{2,}", linea.strip())
+        if len(columnas) < 3:
+            continue
+        destino, accion, origen = columnas[0], columnas[1].upper(), columnas[2]
+        if not re.fullmatch(r"(ALLOW|LIMIT)(\s+IN)?", accion):
             continue
 
-        linea_lower = linea.lower()
+        destino = re.sub(r"\s*\(v6\)", "", destino)
+        destino = re.sub(r"\s+on\s+\S+$", "", destino).strip()
+        origen = re.sub(r"\s*\(v6\)", "", origen).strip()
 
-        # ── Intentar resolver como perfil de aplicación primero ───────────────
-        perfil_encontrado = False
-        for fragmento, puertos in PERFILES_APP:
-            if fragmento in linea_lower:
-                puertos_detectados.update(puertos)
-                perfiles_resueltos.append(
-                    f"{linea.split()[0]} → puerto(s) {', '.join(puertos)}"
+        if destino.lower() == "anywhere":
+            _registrar_hallazgo(
+                resultado, "firewall_reglas_a_revisar",
+                f"Regla UFW que permite TODO el tráfico entrante desde {origen}.",
+            )
+        elif re.fullmatch(r"[\d,:]+(/(tcp|udp))?", destino, re.IGNORECASE):
+            puertos_detectados.update(_normalizar_puertos(destino))
+        else:
+            puertos_perfil = _puertos_perfil_ufw(destino)
+            if puertos_perfil is None:
+                _registrar_hallazgo(
+                    resultado, "firewall_reglas_a_revisar",
+                    f"No se pudieron resolver los puertos del perfil UFW '{destino}'.",
                 )
-                perfil_encontrado = True
-                break   # cada línea solo se procesa una vez
+            else:
+                print(f"      • Perfil {destino} → {', '.join(puertos_perfil)}")
+                puertos_detectados.update(puertos_perfil)
 
-        # ── Si no hay perfil, buscar puerto numérico directo ──────────────────
-        if not perfil_encontrado:
-            match = re.search(r"(\d+)(?:/(?:tcp|udp))?", linea)
-            if match:
-                puertos_detectados.add(match.group(1))
-
-    resultado["puertos_abiertos"] = sorted(puertos_detectados, key=lambda p: int(p))
-    no_esenciales = [p for p in resultado["puertos_abiertos"] if p not in PUERTOS_ESENCIALES]
-    resultado["puertos_a_revisar"] = no_esenciales
-
-    if perfiles_resueltos:
-        print("  [i] Perfiles de aplicación resueltos:")
-        for pr in perfiles_resueltos:
-            print(f"      • {pr}")
+    resultado["puertos_abiertos"] = sorted(puertos_detectados)
+    resultado["puertos_a_revisar"] = [
+        p for p in resultado["puertos_abiertos"] if not _es_puerto_esencial(p, esenciales)
+    ]
 
     print(f"  [i] Puertos permitidos: {', '.join(resultado['puertos_abiertos']) or 'ninguno'}")
 
-    if no_esenciales:
-        msg = f"Puertos no esenciales detectados: {', '.join(no_esenciales)}"
-        resultado["advertencias"].append(msg)
+    if resultado["puertos_a_revisar"]:
+        msg = f"Puertos no esenciales detectados: {', '.join(resultado['puertos_a_revisar'])}"
+        _registrar_hallazgo(resultado, "puertos_no_esenciales", msg)
         print(f"  [⚠] {msg}")
-        print( "      Recomendación (DRY-RUN): ufw deny <puerto>")
-    else:
-        resultado["ok"] = True
+        print("      Recomendación (DRY-RUN): evaluar y, si procede, cerrar con:")
+        for p in resultado["puertos_a_revisar"]:
+            print(f"        ufw delete allow {p.replace('-', ':')}")
+    elif not resultado["hallazgos"]:
         print("  [✔] Solo están abiertos los puertos esenciales.")
+
+    for adv in resultado["advertencias"]:
+        if not adv.startswith("Puertos no esenciales"):
+            print(f"  [⚠] {adv}")
 
     return resultado
 
 
-def auditar_firewall() -> dict:
+def auditar_firewall(puertos_ssh: Optional[list[str]] = None) -> dict:
     """
     Detecta automáticamente si el sistema usa firewalld o ufw
     y delega en la función de auditoría correspondiente.
+
+    Args:
+        puertos_ssh: Puertos en los que escucha sshd; se consideran esenciales.
 
     Returns:
         Diccionario con los resultados del firewall.
@@ -459,23 +721,25 @@ def auditar_firewall() -> dict:
     print("  [3] GESTIÓN DE FIREWALL")
     print("=" * 64)
 
+    esenciales = PUERTOS_ESENCIALES | set(puertos_ssh or [])
+
     if shutil.which("firewall-cmd"):
         print("  [i] Gestor detectado: firewalld (RHEL/CentOS/Rocky/Fedora)\n")
-        resultado = _auditar_firewalld()
+        resultado = _auditar_firewalld(esenciales)
     elif shutil.which("ufw"):
         print("  [i] Gestor detectado: UFW (Debian/Ubuntu)\n")
-        resultado = _auditar_ufw()
+        resultado = _auditar_ufw(esenciales)
     else:
-        resultado = {
-            "herramienta":       "ninguno",
-            "activo":            False,
-            "puertos_abiertos":  [],
-            "puertos_a_revisar": [],
-            "advertencias":      [
-                "No se encontró firewalld ni ufw. El sistema NO tiene firewall gestionado."
-            ],
-            "ok": False,
-        }
+        resultado = _nuevo_resultado(
+            herramienta="ninguno",
+            activo=False,
+            puertos_abiertos=[],
+            puertos_a_revisar=[],
+        )
+        _registrar_hallazgo(
+            resultado, "firewall_ausente",
+            "No se encontró firewalld ni ufw. El sistema NO tiene firewall gestionado.",
+        )
         print("  [✘] No se encontró ningún gestor de firewall (firewalld / ufw).")
 
     print()
@@ -486,11 +750,21 @@ def auditar_firewall() -> dict:
 # [4] AUDITORÍA DE USUARIOS (ACLs / PERMISOS)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _cuenta_sin_contrasena(resultado: dict, usuario: str, fichero: str) -> None:
+    if usuario in resultado["cuentas_sin_contrasena"]:
+        return
+    adv = f"Cuenta '{usuario}' tiene contraseña VACÍA en {fichero}."
+    resultado["cuentas_sin_contrasena"].append(usuario)
+    _registrar_hallazgo(resultado, "cuenta_sin_contrasena", adv)
+    print(f"  [✘] CRÍTICO: {adv}")
+
+
 def auditar_usuarios() -> dict:
     """
     Audita /etc/passwd y /etc/shadow en busca de:
       - Usuarios con UID 0 distintos de root (escalada de privilegios).
-      - Cuentas con contraseñas vacías en /etc/shadow.
+      - Cuentas con el campo de contraseña vacío en /etc/passwd o
+        /etc/shadow (permiten iniciar sesión sin contraseña).
 
     Returns:
         Diccionario con los hallazgos de la auditoría de usuarios.
@@ -499,14 +773,12 @@ def auditar_usuarios() -> dict:
     print("  [4] AUDITORÍA DE USUARIOS (ACLs / PERMISOS)")
     print("=" * 64)
 
-    resultado: dict = {
-        "usuarios_uid0_no_root":  [],
-        "cuentas_sin_contrasena": [],
-        "total_usuarios":         0,
-        "total_usuarios_sistema": 0,
-        "advertencias":           [],
-        "ok":                     True,
-    }
+    resultado = _nuevo_resultado(
+        usuarios_uid0_no_root=[],
+        cuentas_sin_contrasena=[],
+        total_usuarios=0,
+        total_usuarios_sistema=0,
+    )
 
     # ── /etc/passwd ──────────────────────────────────────────────────────────
     print(f"\n  [i] Analizando {RUTA_PASSWD}...")
@@ -532,9 +804,13 @@ def auditar_usuarios() -> dict:
                 if uid == "0" and usuario != "root":
                     adv = f"Usuario '{usuario}' tiene UID 0 — privilegios equivalentes a root."
                     resultado["usuarios_uid0_no_root"].append(usuario)
-                    resultado["advertencias"].append(adv)
-                    resultado["ok"] = False
+                    _registrar_hallazgo(resultado, "usuario_uid0_no_root", adv)
                     print(f"  [✘] CRÍTICO: {adv}")
+
+                # Campo de contraseña vacío en passwd ("user::...") → sin contraseña.
+                # "x" o "*" delegan en /etc/shadow o bloquean la cuenta.
+                if partes[1] == "":
+                    _cuenta_sin_contrasena(resultado, usuario, RUTA_PASSWD)
 
         if not resultado["usuarios_uid0_no_root"]:
             print("  [✔] Ningún usuario con UID 0 fuera de root.")
@@ -543,18 +819,10 @@ def auditar_usuarios() -> dict:
             f"({resultado['total_usuarios_sistema']} cuentas de sistema)"
         )
 
-    except FileNotFoundError:
-        adv = f"No se encontró el archivo {RUTA_PASSWD}"
-        resultado["advertencias"].append(adv)
-        print(f"  [✘] {adv}")
-    except PermissionError:
-        adv = f"Sin permisos para leer {RUTA_PASSWD}"
-        resultado["advertencias"].append(adv)
-        print(f"  [✘] {adv}")
     except OSError as exc:
-        adv = f"Error leyendo {RUTA_PASSWD}: {exc}"
-        resultado["advertencias"].append(adv)
-        print(f"  [✘] {adv}")
+        err = f"No se pudo leer {RUTA_PASSWD}: {exc.strerror or exc}"
+        _registrar_error(resultado, err)
+        print(f"  [?] {err}")
 
     # ── /etc/shadow ───────────────────────────────────────────────────────────
     print(f"\n  [i] Analizando {RUTA_SHADOW}...")
@@ -568,33 +836,18 @@ def auditar_usuarios() -> dict:
                 if len(partes) < 2:
                     continue
 
-                usuario   = partes[0]
-                hash_pass = partes[1]
-
                 # Campo vacío "" → contraseña en blanco real (riesgo crítico)
                 # "!" o "*" → cuenta bloqueada/sin login → no es un riesgo directo
-                if hash_pass == "":
-                    adv = f"Cuenta '{usuario}' tiene contraseña VACÍA en /etc/shadow."
-                    resultado["cuentas_sin_contrasena"].append(usuario)
-                    resultado["advertencias"].append(adv)
-                    resultado["ok"] = False
-                    print(f"  [✘] CRÍTICO: {adv}")
+                if partes[1] == "":
+                    _cuenta_sin_contrasena(resultado, partes[0], RUTA_SHADOW)
 
-        if not resultado["cuentas_sin_contrasena"]:
-            print("  [✔] Ninguna cuenta con contraseña vacía detectada.")
-
-    except FileNotFoundError:
-        adv = f"No se encontró el archivo {RUTA_SHADOW}"
-        resultado["advertencias"].append(adv)
-        print(f"  [⚠] {adv}")
-    except PermissionError:
-        adv = f"Sin permisos para leer {RUTA_SHADOW} (¿ejecutas como root?)"
-        resultado["advertencias"].append(adv)
-        print(f"  [✘] {adv}")
     except OSError as exc:
-        adv = f"Error leyendo {RUTA_SHADOW}: {exc}"
-        resultado["advertencias"].append(adv)
-        print(f"  [✘] {adv}")
+        err = f"No se pudo leer {RUTA_SHADOW}: {exc.strerror or exc}"
+        _registrar_error(resultado, err)
+        print(f"  [?] {err}")
+
+    if not resultado["cuentas_sin_contrasena"] and not resultado["errores"]:
+        print("  [✔] Ninguna cuenta con contraseña vacía detectada.")
 
     print()
     return resultado
@@ -604,210 +857,262 @@ def auditar_usuarios() -> dict:
 # [5] AUDITORÍA DE SSH
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _resolver_includes(ruta_cfg: str) -> list[tuple[str, int, str]]:
+def _procesar_fichero_sshd(
+    ruta: str,
+    estado: dict,
+    contexto_match: Optional[str],
+    profundidad: int,
+) -> None:
     """
-    Lee un archivo de configuración SSH y resuelve cualquier directiva
-    ``Include`` encontrada, devolviendo todas las líneas (de todos los archivos)
-    como una lista de tuplas ``(ruta_origen, número_de_línea, texto_de_línea)``.
+    Procesa un fichero de configuración de sshd con su misma semántica:
 
-    La resolución sigue el comportamiento de sshd_config:
-      - Si la ruta del Include es relativa, se interpreta como relativa a
-        ``/etc/ssh/``.
-      - Se admiten comodines estándar (``*``, ``?``, ``[…]``) usando
-        ``glob.glob``.
-      - Los archivos resultantes se ordenan alfabéticamente, igual que sshd.
-      - Las directivas Include anidadas NO se resuelven (sshd tampoco lo hace).
-
-    Args:
-        ruta_cfg: Ruta absoluta del archivo de configuración principal.
-
-    Returns:
-        Lista de tuplas (ruta_archivo, num_linea, texto_linea) con el contenido
-        combinado del archivo principal y todos los archivos incluidos.
+      - Admite "Clave valor" y "Clave=valor"; claves insensibles a mayúsculas.
+      - Gana el PRIMER valor de cada directiva (sshd ignora los siguientes).
+      - Las directivas tras un bloque ``Match`` son condicionales: se guardan
+        aparte y no cuentan como valor global.
+      - ``Include`` admite varios patrones y comodines, rutas relativas a
+        /etc/ssh y anidamiento hasta SSHD_MAX_PROFUNDIDAD_INCLUDE niveles.
+        Un ``Match`` abierto dentro de un fichero incluido no se propaga al
+        fichero que lo incluye.
     """
-    SSH_DIR = "/etc/ssh"
-    lineas_combinadas: list[tuple[str, int, str]] = []
+    if profundidad > SSHD_MAX_PROFUNDIDAD_INCLUDE:
+        estado["errores"].append(f"Include demasiado anidado en {ruta}; se ignora.")
+        return
 
     try:
-        with open(ruta_cfg, "r", encoding="utf-8", errors="replace") as fh:
-            lineas_principales = fh.readlines()
-    except OSError:
-        return lineas_combinadas  # El llamador manejará el error
+        with open(ruta, "r", encoding="utf-8", errors="replace") as fh:
+            lineas = fh.readlines()
+    except OSError as exc:
+        estado["errores"].append(f"No se pudo leer {ruta}: {exc.strerror or exc}")
+        return
 
-    for num, linea in enumerate(lineas_principales, start=1):
-        linea_limpia = linea.strip()
+    if ruta not in estado["archivos"]:
+        estado["archivos"].append(ruta)
 
-        # Detectar directiva Include (case-insensitive)
-        if re.match(r"(?i)^include\s+", linea_limpia) and not linea_limpia.startswith("#"):
-            partes = linea_limpia.split(None, 1)
-            if len(partes) < 2:
-                continue
+    directorio_ssh = os.path.dirname(RUTA_SSHD_CFG)
 
-            patron = partes[1].strip()
+    for num, linea in enumerate(lineas, start=1):
+        limpia = linea.strip()
+        if not limpia or limpia.startswith("#"):
+            continue
 
-            # Si la ruta no es absoluta, resolverla relativa a /etc/ssh/
-            if not os.path.isabs(patron):
-                patron = os.path.join(SSH_DIR, patron)
+        coincidencia = re.match(r"([A-Za-z0-9]+)\s*(?:=\s*|\s+)(.*)$", limpia)
+        if not coincidencia:
+            continue
+        clave = coincidencia.group(1).lower()
+        valor = coincidencia.group(2).strip().strip('"')
 
-            # Expandir comodines y ordenar alfabéticamente (comportamiento sshd)
-            archivos_incluidos = sorted(glob.glob(patron))
+        if clave == "match":
+            contexto_match = None if valor.lower() == "all" else valor
+            continue
 
-            for ruta_inc in archivos_incluidos:
-                try:
-                    with open(ruta_inc, "r", encoding="utf-8", errors="replace") as fh_inc:
-                        for num_inc, linea_inc in enumerate(fh_inc.readlines(), start=1):
-                            lineas_combinadas.append((ruta_inc, num_inc, linea_inc))
-                except OSError as exc:
-                    # Registrar el problema pero continuar con los demás archivos
-                    lineas_combinadas.append(
-                        (ruta_inc, 0, f"# [GhostCheck ERROR] No se pudo leer {ruta_inc}: {exc}\n")
-                    )
+        if clave == "include":
+            for patron in valor.split():
+                if not os.path.isabs(patron):
+                    patron = os.path.join(directorio_ssh, patron)
+                for incluido in sorted(glob.glob(patron)):
+                    _procesar_fichero_sshd(incluido, estado, contexto_match, profundidad + 1)
+            continue
+
+        entrada = {"valor": valor, "archivo": ruta, "linea": num}
+        if contexto_match is None:
+            if clave == "port":
+                estado["puertos"].append(valor)   # Port es acumulativo en sshd
+            estado["valores"].setdefault(clave, entrada)
         else:
-            lineas_combinadas.append((ruta_cfg, num, linea))
-
-    return lineas_combinadas
+            estado["condicionales"].append({**entrada, "clave": clave, "match": contexto_match})
 
 
-def auditar_ssh() -> dict:
+def _parsear_sshd_config(ruta: str) -> dict:
+    """Analiza sshd_config y sus Include. Ver _procesar_fichero_sshd."""
+    estado: dict = {"valores": {}, "condicionales": [], "archivos": [], "errores": [], "puertos": []}
+    _procesar_fichero_sshd(ruta, estado, None, 0)
+    return estado
+
+
+def _config_efectiva_sshd() -> tuple[Optional[dict[str, list[str]]], str]:
     """
-    Analiza /etc/ssh/sshd_config (y los archivos que incluya vía ``Include``)
-    en busca de directivas de riesgo alto.
-
-    Mejoras sobre la versión original:
-      - Resuelve automáticamente las directivas ``Include`` del archivo
-        principal usando ``glob``, evaluando también los fragmentos en
-        ``/etc/ssh/sshd_config.d/*.conf`` u otras rutas incluidas.
-      - El reporte indica en qué archivo y línea exacta se encontró cada
-        directiva peligrosa.
-
-    Lógica de parsing:
-      - Ignora líneas vacías y comentadas (comienzan con '#').
-      - Es insensible a mayúsculas/minúsculas en el nombre de la directiva.
-      - Detecta directivas activas con valores peligrosos definidos en
-        SSHD_DIRECTIVAS_RIESGO.
+    Obtiene la configuración efectiva con `sshd -T` (solo lectura: sshd
+    valida y vuelca la configuración sin arrancar ni modificar nada).
 
     Returns:
-        Diccionario con directivas peligrosas encontradas, resumen de la
-        configuración y lista de advertencias.
+        (valores, motivo). ``valores`` es None si no se pudo obtener, y
+        ``motivo`` explica por qué.
+    """
+    if not shutil.which("sshd"):
+        return None, "sshd no está en el PATH"
+    codigo, stdout, stderr = ejecutar_comando(["sshd", "-T", "-f", RUTA_SSHD_CFG])
+    if codigo != 0 or not stdout:
+        return None, f"sshd -T falló: {stderr or codigo}"
+    valores: dict[str, list[str]] = {}
+    for linea in stdout.splitlines():
+        clave, _, valor = linea.strip().partition(" ")
+        if clave:
+            valores.setdefault(clave.lower(), []).append(valor.strip())
+    return valores, ""
+
+
+def cargar_config_ssh() -> dict:
+    """
+    Determina los valores efectivos de las directivas de riesgo de sshd.
+
+    Fuente principal: `sshd -T`. Si no está disponible se usa el análisis
+    de los ficheros con la semántica de sshd y sus valores por defecto.
+    En ambos casos se intenta localizar el fichero y la línea de origen.
+
+    Returns:
+        Diccionario con: fuente, valores (clave → valor/archivo/línea),
+        condicionales, archivos, puertos, errores y existe.
+    """
+    existe = os.path.exists(RUTA_SSHD_CFG)
+    parseado = (
+        _parsear_sshd_config(RUTA_SSHD_CFG)
+        if existe
+        else {"valores": {}, "condicionales": [], "archivos": [], "errores": [], "puertos": []}
+    )
+    efectiva, motivo = _config_efectiva_sshd() if existe else (None, "")
+
+    valores: dict[str, dict] = {}
+    for clave in SSHD_DIRECTIVAS_RIESGO:
+        origen = parseado["valores"].get(clave)
+        if efectiva is not None and clave in efectiva:
+            valor = efectiva[clave][0]
+            if origen and origen["valor"].lower() == valor.lower():
+                valores[clave] = {**origen, "valor": valor}
+            else:
+                valores[clave] = {"valor": valor, "archivo": None, "linea": 0}
+        elif origen:
+            valores[clave] = origen
+        elif efectiva is None and clave in SSHD_VALORES_DEFECTO:
+            valores[clave] = {"valor": SSHD_VALORES_DEFECTO[clave], "archivo": None, "linea": 0}
+
+    if efectiva is not None and efectiva.get("port"):
+        puertos = efectiva["port"]
+    else:
+        puertos = parseado["puertos"] or ["22"]
+
+    return {
+        "existe":        existe,
+        "fuente":        "sshd -T" if efectiva is not None else "análisis de ficheros",
+        "motivo_fuente": motivo,
+        "valores":       valores,
+        "condicionales": parseado["condicionales"],
+        "archivos":      parseado["archivos"],
+        "puertos":       puertos,
+        "errores":       parseado["errores"],
+    }
+
+
+def auditar_ssh(config: Optional[dict] = None) -> dict:
+    """
+    Evalúa la configuración efectiva de sshd en busca de directivas de riesgo.
+
+    Args:
+        config: Resultado de cargar_config_ssh(); si es None se calcula.
+
+    Returns:
+        Diccionario con directivas peligrosas (con fichero y línea de
+        origen cuando se conocen), puertos, hallazgos y errores.
     """
     print("=" * 64)
-    print("  [5] AUDITORÍA DE SSH (sshd_config + Include)")
+    print("  [5] AUDITORÍA DE SSH (configuración efectiva)")
     print("=" * 64)
 
-    resultado: dict = {
-        "ruta_config":        RUTA_SSHD_CFG,
-        "archivos_analizados": [],   # list[str] — todos los archivos leídos
-        "directivas_riesgo":  [],    # list[dict]
-        "directivas_seguras": [],
-        "puerto_ssh":         "22",
-        "advertencias":       [],
-        "ok":                 True,
-    }
+    config = config if config is not None else cargar_config_ssh()
 
-    print(f"\n  [i] Leyendo {RUTA_SSHD_CFG} (resolviendo Include si existe)...")
+    resultado = _nuevo_resultado(
+        estado="OK",
+        ruta_config=RUTA_SSHD_CFG,
+        fuente=config["fuente"],
+        archivos_analizados=config["archivos"],
+        directivas_riesgo=[],          # list[dict]
+        directivas_condicionales=[],   # list[dict] — dentro de bloques Match
+        directivas_seguras=[],
+        puertos_ssh=config["puertos"],
+        puerto_ssh=", ".join(config["puertos"]),
+    )
 
-    # Verificar existencia y permisos antes de llamar al resolvedor
-    if not os.path.exists(RUTA_SSHD_CFG):
-        adv = f"No se encontró {RUTA_SSHD_CFG}. ¿Está instalado el servidor SSH?"
-        resultado["advertencias"].append(adv)
-        print(f"  [⚠] {adv}")
+    if not config["existe"]:
+        resultado["estado"] = "NO_INSTALADO"
+        print(f"  [i] No se encontró {RUTA_SSHD_CFG}: el servidor SSH no parece instalado.")
         print()
         return resultado
 
-    if not os.access(RUTA_SSHD_CFG, os.R_OK):
-        adv = f"Sin permisos para leer {RUTA_SSHD_CFG}"
-        resultado["advertencias"].append(adv)
-        print(f"  [✘] {adv}")
-        print()
-        return resultado
+    print(f"  [i] Fuente: {config['fuente']}")
+    if config["motivo_fuente"]:
+        print(f"      ({config['motivo_fuente']}; se analizan los ficheros directamente)")
+    for arc in config["archivos"]:
+        print(f"      • {arc}")
 
-    # Obtener todas las líneas del archivo principal + los archivos incluidos
-    lineas_totales = _resolver_includes(RUTA_SSHD_CFG)
+    if config["fuente"] != "sshd -T":
+        for err in config["errores"]:
+            _registrar_error(resultado, err)
+            print(f"  [?] {err}")
 
-    # Registrar qué archivos únicos se procesaron (para el reporte)
-    archivos_vistos: list[str] = []
-    for ruta_arc, _, _ in lineas_totales:
-        if ruta_arc not in archivos_vistos:
-            archivos_vistos.append(ruta_arc)
-    resultado["archivos_analizados"] = archivos_vistos
-
-    if len(archivos_vistos) > 1:
-        print(f"  [i] Archivos analizados ({len(archivos_vistos)}):")
-        for arc in archivos_vistos:
-            print(f"      • {arc}")
-    else:
-        print(f"  [i] Archivo analizado: {RUTA_SSHD_CFG}")
-
-    # Descripciones legibles de cada directiva de riesgo
-    descripciones: dict[str, str] = {
-        "PermitRootLogin":        "Permite login directo como root vía SSH — vector de ataque primario.",
-        "PasswordAuthentication": "Permite autenticación por contraseña — vulnerable a fuerza bruta.",
-        "PermitEmptyPasswords":   "Permite login SSH sin contraseña — riesgo CRÍTICO.",
-        "X11Forwarding":          "Reenvío X11 activo — aumenta la superficie de ataque.",
-        "Protocol":               "SSHv1 habilitado — protocolo obsoleto con vulnerabilidades conocidas.",
-    }
-
-    for ruta_arc, num, linea in lineas_totales:
-        linea_limpia = linea.strip()
-
-        # Saltar comentarios y líneas vacías
-        if not linea_limpia or linea_limpia.startswith("#"):
+    for clave, (nombre, peligroso, codigo) in SSHD_DIRECTIVAS_RIESGO.items():
+        entrada = config["valores"].get(clave)
+        if entrada is None:
+            continue
+        valor = entrada["valor"]
+        if valor.lower() != peligroso:
+            resultado["directivas_seguras"].append(f"{nombre} {valor}")
             continue
 
-        partes = linea_limpia.split(None, 1)
-        if len(partes) < 2:
-            continue
+        if entrada["archivo"]:
+            origen = f"{entrada['archivo']}:{entrada['linea']}"
+        elif config["fuente"] == "sshd -T":
+            origen = "configuración efectiva (sshd -T, valor por defecto)"
+        else:
+            origen = "valor por defecto de OpenSSH"
 
-        directiva = partes[0].strip()
-        valor     = partes[1].strip().lower()
+        hallazgo = {
+            "directiva":   nombre,
+            "valor":       valor,
+            "linea_num":   entrada["linea"],
+            "archivo":     entrada["archivo"],
+            "origen":      origen,
+            "descripcion": SSHD_DESCRIPCIONES[clave],
+        }
+        resultado["directivas_riesgo"].append(hallazgo)
+        _registrar_hallazgo(
+            resultado, codigo, f"{origen}: '{nombre} {valor}' — {SSHD_DESCRIPCIONES[clave]}"
+        )
+        print(f"  [✘] RIESGO — {origen}: {nombre} {valor}")
+        print(f"      {SSHD_DESCRIPCIONES[clave]}")
 
-        # Detectar el puerto SSH
-        if directiva.lower() == "port":
-            resultado["puerto_ssh"] = partes[1].strip()
+    for cond in config["condicionales"]:
+        riesgo = SSHD_DIRECTIVAS_RIESGO.get(cond["clave"])
+        if riesgo and cond["valor"].lower() == riesgo[1]:
+            nombre = riesgo[0]
+            origen = f"{cond['archivo']}:{cond['linea']}"
+            resultado["directivas_condicionales"].append(
+                {"directiva": nombre, "valor": cond["valor"], "match": cond["match"], "origen": origen}
+            )
+            _registrar_hallazgo(
+                resultado, "ssh_riesgo_condicional",
+                f"{origen}: '{nombre} {cond['valor']}' dentro de 'Match {cond['match']}'.",
+            )
+            print(f"  [⚠] Condicional — {origen}: Match {cond['match']} → {nombre} {cond['valor']}")
 
-        # Comprobar contra el mapa de directivas peligrosas
-        for dir_riesgo, val_peligroso in SSHD_DIRECTIVAS_RIESGO.items():
-            if directiva.lower() == dir_riesgo.lower() and valor == val_peligroso.lower():
-                origen = (
-                    f"{os.path.basename(ruta_arc)}:{num}"
-                    if ruta_arc != RUTA_SSHD_CFG
-                    else f"línea {num}"
-                )
-                hallazgo = {
-                    "directiva":   directiva,
-                    "valor":       partes[1].strip(),
-                    "linea_num":   num,
-                    "archivo":     ruta_arc,
-                    "descripcion": descripciones.get(dir_riesgo, "Directiva de riesgo detectada."),
-                }
-                resultado["directivas_riesgo"].append(hallazgo)
-                resultado["advertencias"].append(
-                    f"{origen}: '{directiva} {partes[1].strip()}' — "
-                    f"{descripciones.get(dir_riesgo, '')}"
-                )
-                resultado["ok"] = False
-                print(f"  [✘] RIESGO ALTO  — {origen}: {directiva} {partes[1].strip()}")
-                print(f"      {descripciones.get(dir_riesgo, '')}")
+    if not resultado["hallazgos"]:
+        print("  [✔] No se detectaron directivas SSH de riesgo.")
 
-            elif directiva.lower() == dir_riesgo.lower():
-                resultado["directivas_seguras"].append(f"{directiva} {partes[1].strip()}")
-
-    if resultado["ok"]:
-        print("  [✔] No se detectaron directivas SSH de alto riesgo.")
-
-    print(f"  [i] Puerto SSH en uso          : {resultado['puerto_ssh']}")
+    print(f"  [i] Puerto(s) SSH             : {resultado['puerto_ssh']}")
     print(f"  [i] Directivas de riesgo       : {len(resultado['directivas_riesgo'])}")
     print(f"  [i] Directivas seguras halladas: {len(resultado['directivas_seguras'])}")
 
     if resultado["directivas_riesgo"]:
         print()
         print("  Recomendaciones (DRY-RUN) para /etc/ssh/sshd_config:")
-        if any(h["directiva"].lower() == "permitrootlogin" for h in resultado["directivas_riesgo"]):
+        riesgos = {h["directiva"].lower() for h in resultado["directivas_riesgo"]}
+        if "permitrootlogin" in riesgos:
             print("    PermitRootLogin no           # Deshabilitar login directo como root")
-        if any(h["directiva"].lower() == "passwordauthentication" for h in resultado["directivas_riesgo"]):
+        if "passwordauthentication" in riesgos:
             print("    PasswordAuthentication no    # Usar solo autenticación por clave pública")
-        if any(h["directiva"].lower() == "permitemptypasswords" for h in resultado["directivas_riesgo"]):
+        if "permitemptypasswords" in riesgos:
             print("    PermitEmptyPasswords no      # NUNCA permitir contraseñas vacías")
+        if "x11forwarding" in riesgos:
+            print("    X11Forwarding no             # Desactivar reenvío X11")
         print("    Tras editar: systemctl restart sshd")
 
     print()
@@ -818,123 +1123,152 @@ def auditar_ssh() -> dict:
 # [6] AUDITORÍA DE ACTUALIZACIONES DE SEGURIDAD (RHEL/Rocky)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def auditar_actualizaciones() -> dict:
+_PATRON_AVISO = re.compile(r"[A-Z][A-Z0-9-]*-\d{4}[:-][0-9A-Za-z]+")
+_PATRON_FECHA = re.compile(r"\d{4}-\d{2}-\d{2}")
+_SEVERIDADES_DNF = ("Critical", "Important", "Moderate", "Low")
+
+
+def _parsear_updateinfo(stdout: str) -> list[dict]:
     """
-    Comprueba si existen actualizaciones de seguridad pendientes en sistemas
-    basados en RPM/DNF (RHEL, Rocky Linux, AlmaLinux, CentOS Stream, Fedora).
+    Interpreta la salida de `dnf updateinfo list --security` (dnf4 y dnf5).
 
-    Códigos de salida documentados de `dnf check-update`:
-      0   → El sistema está completamente actualizado.
-      100 → Hay paquetes con actualizaciones disponibles.
-      1   → Error durante la ejecución del comando.
-
-    La flag `--security` restringe la búsqueda solo a actualizaciones de
-    seguridad publicadas en los repositorios activos (errata de tipo 'security').
+      dnf4: RHSA-2024:3306 Moderate/Sec.  kernel-5.14.0-427.el9.x86_64
+      dnf5: RHSA-2024:3306 security Moderate kernel-5.14.0-427.el9.x86_64 2024-05-28 23:18:13
 
     Returns:
-        Diccionario con el estado de actualización, lista de paquetes
-        pendientes y las advertencias generadas.
+        Lista de avisos: {"aviso", "severidad", "paquete"}.
+    """
+    avisos: list[dict] = []
+    for linea in stdout.splitlines():
+        tokens = linea.split()
+        if len(tokens) < 2 or not _PATRON_AVISO.fullmatch(tokens[0]):
+            continue
+        severidad = "Desconocida"
+        for tok in tokens[1:]:
+            base = tok.split("/")[0].capitalize()
+            if base in _SEVERIDADES_DNF:
+                severidad = base
+                break
+        candidatos = [
+            t for t in tokens[1:]
+            if "/" not in t and "." in t and re.search(r"-\d", t) and not _PATRON_FECHA.fullmatch(t)
+        ]
+        paquete = candidatos[-1] if candidatos else tokens[-1]
+        avisos.append({"aviso": tokens[0], "severidad": severidad, "paquete": paquete})
+    return avisos
+
+
+def auditar_actualizaciones(offline: bool = False) -> dict:
+    """
+    Comprueba si existen actualizaciones de seguridad pendientes en sistemas
+    basados en RPM/DNF (RHEL, Rocky Linux, AlmaLinux, CentOS Stream, Fedora)
+    con `dnf -q updateinfo list --security`, que lista los avisos de
+    seguridad aplicables a los paquetes instalados.
+
+    Args:
+        offline: Si es True se añade ``-C`` (solo caché): dnf no contacta con
+            los repositorios ni actualiza sus metadatos en /var/cache/dnf.
+
+    Returns:
+        Diccionario con el estado de actualización, paquetes pendientes,
+        avisos por severidad, hallazgos y errores.
     """
     print("=" * 64)
     print("  [6] AUDITORÍA DE ACTUALIZACIONES DE SEGURIDAD")
     print("=" * 64)
 
-    resultado: dict = {
-        "gestor":              "dnf",
-        "estado":              "DESCONOCIDO",
-        "paquetes_pendientes": [],  # list[str] — "nombre versión repositorio"
-        "total_pendientes":    0,
-        "advertencias":        [],
-        "ok":                  False,
-    }
+    resultado = _nuevo_resultado(
+        gestor="dnf",
+        estado="DESCONOCIDO",
+        paquetes_pendientes=[],   # list[str] — "paquete [aviso, severidad]"
+        total_pendientes=0,
+        avisos=[],                # list[dict]
+        severidades={},           # severidad → nº de avisos
+    )
 
     # Verificar que dnf está disponible antes de molestar a los repositorios
     if not shutil.which("dnf"):
-        adv = "dnf no está disponible. Este módulo es específico de RHEL/Rocky/Fedora."
-        resultado["advertencias"].append(adv)
+        err = "dnf no está disponible. Este módulo es específico de RHEL/Rocky/Fedora."
+        _registrar_error(resultado, err)
         resultado["estado"] = "NO_DISPONIBLE"
-        print(f"  [⚠] {adv}")
+        print(f"  [?] {err}")
         print()
         return resultado
 
+    comando = ["dnf", "-q"] + (["-C"] if offline else []) + ["updateinfo", "list", "--security"]
+    if offline:
+        print("  [i] Modo offline: se usa solo la caché local de dnf (-C).")
+
     # dnf puede tardar la vida consultando metadatos remotos — el spinner evita
     # que el operario piense que el proceso se ha colgado y lo mate con Ctrl+C
-    with Spinner("Consultando repositorios con dnf check-update --security..."):
-        codigo, stdout, stderr = ejecutar_comando(
-            ["dnf", "check-update", "--security"],
-            timeout=120   # timeout extendido: necesita contactar repos remotos
-        )
+    with Spinner("Consultando avisos de seguridad con dnf updateinfo..."):
+        codigo, stdout, stderr = ejecutar_comando(comando, timeout=120)
 
-    # ── Interpretar el código de salida ──────────────────────────────────────
-
-    if codigo == 0:
-        # El sistema está al día — no hay que hacer nada, cortar por lo sano
-        resultado["estado"] = "ACTUALIZADO"
-        resultado["ok"]     = True
-        print("  [✔] No hay actualizaciones de seguridad pendientes. Sistema al día.")
-
-    elif codigo == 100:
-        # Código 100: hay parches de seguridad esperando en los repos
-        resultado["estado"] = "ACTUALIZACIONES_PENDIENTES"
-        resultado["ok"]     = False
-
-        # Parsear la salida: cada línea válida tiene formato
-        # "nombre_paquete  nueva_version  repositorio"
-        paquetes: list[str] = []
-        for linea in stdout.splitlines():
-            linea = linea.strip()
-            # Saltar cabeceras, líneas vacías y mensajes de metadatos de dnf
-            if (not linea
-                    or linea.startswith("Last metadata")
-                    or linea.startswith("Obsoleting")
-                    or linea.startswith("Security:")):
-                continue
-            # Una línea de paquete tiene al menos 2 columnas
-            if len(linea.split()) >= 2:
-                paquetes.append(linea)
-
-        resultado["paquetes_pendientes"] = paquetes
-        resultado["total_pendientes"]    = len(paquetes)
-
-        adv = f"{len(paquetes)} actualización(es) de seguridad pendiente(s) detectada(s)."
-        resultado["advertencias"].append(adv)
-        print(f"  [✘] {adv}")
-
-        # Mostrar solo los primeros 10 — más que eso es basura visual en consola
-        limite = min(10, len(paquetes))
-        print(f"\n  Primeros {limite} paquetes pendientes:")
-        for pkg in paquetes[:limite]:
-            print(f"    • {pkg}")
-        if len(paquetes) > 10:
-            print(f"    ... y {len(paquetes) - 10} más (ver reporte completo).")
-
-        print()
-        print("  Recomendación (DRY-RUN): aplicar actualizaciones con:")
-        print("    sudo dnf update --security -y")
-
-    elif codigo == -1:
-        # dnf no encontrado en PATH — no debería llegar aquí, pero por si acaso
-        adv = f"dnf no encontrado en PATH: {stderr}"
-        resultado["advertencias"].append(adv)
-        resultado["estado"] = "ERROR"
-        print(f"  [✘] {adv}")
-
-    elif codigo == -2:
-        # Los repos tardaron demasiado — problema de red o de mirror muerto
-        adv = (
+    if codigo == -2:
+        err = (
             "Timeout esperando respuesta de dnf. "
             "Revisa la conectividad con los repositorios — puede que algún mirror esté caído."
         )
-        resultado["advertencias"].append(adv)
+        _registrar_error(resultado, err)
         resultado["estado"] = "ERROR_TIMEOUT"
-        print(f"  [✘] {adv}")
+        print(f"  [?] {err}")
+        print()
+        return resultado
 
-    else:
-        # Código 1 u otro: dnf encontró algo que no le gustó — ver stderr
-        adv = f"dnf check-update terminó con error (código {codigo}): {stderr or stdout}"
-        resultado["advertencias"].append(adv)
+    if codigo != 0:
+        err = f"dnf updateinfo terminó con error (código {codigo}): {stderr or stdout}"
+        _registrar_error(resultado, err)
         resultado["estado"] = "ERROR"
-        print(f"  [✘] {adv}")
+        print(f"  [?] {err}")
+        print()
+        return resultado
+
+    avisos = _parsear_updateinfo(stdout)
+    resultado["avisos"] = avisos
+
+    if not avisos:
+        resultado["estado"] = "ACTUALIZADO"
+        print("  [✔] No hay actualizaciones de seguridad pendientes. Sistema al día.")
+        print()
+        return resultado
+
+    resultado["estado"] = "ACTUALIZACIONES_PENDIENTES"
+    por_paquete: dict[str, list[dict]] = {}
+    for aviso in avisos:
+        por_paquete.setdefault(aviso["paquete"], []).append(aviso)
+        resultado["severidades"][aviso["severidad"]] = (
+            resultado["severidades"].get(aviso["severidad"], 0) + 1
+        )
+    resultado["paquetes_pendientes"] = [
+        f"{pkg}  [" + ", ".join(f"{a['aviso']} {a['severidad']}" for a in lista) + "]"
+        for pkg, lista in por_paquete.items()
+    ]
+    resultado["total_pendientes"] = len(por_paquete)
+
+    resumen_sev = ", ".join(
+        f"{n} {sev}" for sev, n in sorted(
+            resultado["severidades"].items(),
+            key=lambda kv: (_SEVERIDADES_DNF + ("Desconocida",)).index(kv[0]),
+        )
+    )
+    adv = (
+        f"{len(por_paquete)} paquete(s) con actualizaciones de seguridad pendientes "
+        f"({len(avisos)} aviso(s): {resumen_sev})."
+    )
+    _registrar_hallazgo(resultado, "actualizaciones_seguridad", adv)
+    print(f"  [✘] {adv}")
+
+    # Mostrar solo los primeros 10 — más que eso es basura visual en consola
+    limite = min(10, len(resultado["paquetes_pendientes"]))
+    print(f"\n  Primeros {limite} paquetes pendientes:")
+    for pkg in resultado["paquetes_pendientes"][:limite]:
+        print(f"    • {pkg}")
+    if len(resultado["paquetes_pendientes"]) > 10:
+        print(f"    ... y {len(resultado['paquetes_pendientes']) - 10} más (ver reporte completo).")
+
+    print()
+    print("  Recomendación (DRY-RUN): aplicar actualizaciones con:")
+    print("    sudo dnf update --security -y")
 
     print()
     return resultado
@@ -965,58 +1299,33 @@ def escribir_reporte_seguro(ruta: str, contenido: str) -> None:
 
 def _calcular_nivel_riesgo(resultados: dict) -> str:
     """
-    Determina el nivel de riesgo global de la auditoría basándose en los
-    hallazgos de todos los módulos.
+    Nivel de riesgo global: la severidad máxima de todos los hallazgos, según
+    la tabla SEVERIDADES. Sin hallazgos → "BAJO".
 
-    Criterios (en orden de precedencia descendente):
-      CRÍTICO → usuarios con UID 0 distintos de root, cuentas sin contraseña,
-                directiva PermitRootLogin yes o PermitEmptyPasswords yes activas.
-      ALTO    → actualizaciones de seguridad pendientes, otras directivas SSH
-                de riesgo, o más de 3 advertencias en total.
-      MEDIO   → alguna advertencia puntual (SELinux Permissive, puertos extra,
-                firewall inactivo, etc.).
-      BAJO    → ninguna advertencia en ningún módulo.
-
-    Args:
-        resultados: Diccionario con las salidas de todos los módulos.
+    Los errores (comprobaciones no realizadas) no suben el nivel; se
+    informan aparte con _comprobaciones_no_realizadas().
 
     Returns:
-        String con el nivel: "BAJO", "MEDIO", "ALTO" o "CRÍTICO".
+        "BAJO", "MEDIO", "ALTO" o "CRÍTICO".
     """
-    u  = resultados.get("usuarios", {})
-    s  = resultados.get("ssh", {})
-    ac = resultados.get("actualizaciones", {})
+    indice = 0
+    for modulo in MODULOS:
+        for hallazgo in resultados.get(modulo, {}).get("hallazgos", []):
+            indice = max(indice, NIVELES_RIESGO.index(hallazgo["severidad"]))
+    return NIVELES_RIESGO[indice]
 
-    # ── Condiciones CRÍTICAS ──────────────────────────────────────────────────
-    uid0_extra     = len(u.get("usuarios_uid0_no_root", []))
-    sin_contrasena = len(u.get("cuentas_sin_contrasena", []))
 
-    # PermitRootLogin yes o PermitEmptyPasswords yes son condiciones críticas
-    ssh_critico = any(
-        h["directiva"].lower() in ("permitrootlogin", "permitemptypasswords")
-        for h in s.get("directivas_riesgo", [])
-    )
+def _comprobaciones_no_realizadas(resultados: dict) -> list[str]:
+    """Errores de todos los módulos: si hay alguno, la auditoría está INCOMPLETA."""
+    return [
+        f"[{modulo}] {err}"
+        for modulo in MODULOS
+        for err in resultados.get(modulo, {}).get("errores", [])
+    ]
 
-    if uid0_extra > 0 or sin_contrasena > 0 or ssh_critico:
-        return "CRÍTICO"
 
-    # ── Condiciones ALTAS ─────────────────────────────────────────────────────
-    hay_actualizaciones = ac.get("estado") == "ACTUALIZACIONES_PENDIENTES"
-    ssh_riesgo_alto     = len(s.get("directivas_riesgo", [])) > 0
-
-    total_advertencias = sum(
-        len(resultados.get(mod, {}).get("advertencias", []))
-        for mod in ("selinux", "firewall", "usuarios", "ssh", "actualizaciones")
-    )
-
-    if hay_actualizaciones or ssh_riesgo_alto or total_advertencias > 3:
-        return "ALTO"
-
-    # ── Condiciones MEDIAS ────────────────────────────────────────────────────
-    if total_advertencias > 0:
-        return "MEDIO"
-
-    return "BAJO"
+def _total_advertencias(resultados: dict) -> int:
+    return sum(len(resultados.get(m, {}).get("advertencias", [])) for m in MODULOS)
 
 
 def generar_reporte_txt(resultados: dict, ruta_salida: Optional[str] = None) -> str:
@@ -1036,11 +1345,23 @@ def generar_reporte_txt(resultados: dict, ruta_salida: Optional[str] = None) -> 
     _, hostname, _ = ejecutar_comando(["hostname", "-f"])
     hostname       = hostname or "desconocido"
 
+    sl = resultados.get("selinux", {})
     s  = resultados.get("ssh", {})
     ac = resultados.get("actualizaciones", {})
+    no_realizadas = _comprobaciones_no_realizadas(resultados)
+    estado_auditoria = (
+        f"INCOMPLETA ({len(no_realizadas)} comprobación(es) no realizada(s))"
+        if no_realizadas else "COMPLETA"
+    )
 
     def _sep(titulo: str = "") -> str:
         return f"{'─' * 64}\n{titulo}" if titulo else "─" * 64
+
+    def _avisos(modulo: dict) -> list[str]:
+        return (
+            [f"  [⚠] {adv}" for adv in modulo.get("advertencias", [])]
+            + [f"  [?] No comprobado: {err}" for err in modulo.get("errores", [])]
+        )
 
     lineas: list[str] = [
         "=" * 64,
@@ -1051,6 +1372,7 @@ def generar_reporte_txt(resultados: dict, ruta_salida: Optional[str] = None) -> 
         f"  Hostname        : {hostname}",
         f"  Modo            : DRY-RUN (solo auditoría, sin cambios)",
         f"  Nivel de riesgo : {nivel_riesgo}",
+        f"  Auditoría       : {estado_auditoria}",
         "=" * 64,
         "",
         _sep("[1] PRIVILEGIOS DE EJECUCIÓN"),
@@ -1059,12 +1381,12 @@ def generar_reporte_txt(resultados: dict, ruta_salida: Optional[str] = None) -> 
         "",
         _sep("[2] AUDITORÍA DE SELINUX"),
         _sep(),
-        f"  Estado   : {resultados.get('selinux', {}).get('estado', 'N/A')}",
-        f"  Modo     : {resultados.get('selinux', {}).get('modo', 'N/A')}",
-        f"  Política : {resultados.get('selinux', {}).get('politica', 'N/A')}",
+        f"  Estado            : {sl.get('estado') or 'N/A'}",
+        f"  Modo              : {sl.get('modo') or 'N/A'}",
+        f"  Modo persistente  : {sl.get('modo_persistente') or 'N/A'}",
+        f"  Política          : {sl.get('politica') or 'N/A'}",
     ]
-    for adv in resultados.get("selinux", {}).get("advertencias", []):
-        lineas.append(f"  [⚠] {adv}")
+    lineas += _avisos(sl)
 
     fw = resultados.get("firewall", {})
     lineas += [
@@ -1073,11 +1395,11 @@ def generar_reporte_txt(resultados: dict, ruta_salida: Optional[str] = None) -> 
         _sep(),
         f"  Herramienta     : {fw.get('herramienta', 'N/A')}",
         f"  Activo          : {'Sí' if fw.get('activo') else 'No'}",
+        f"  Zonas auditadas : {', '.join(fw.get('zonas', [])) or 'N/A'}",
         f"  Puertos abiertos: {', '.join(fw.get('puertos_abiertos', [])) or 'ninguno'}",
         f"  A revisar       : {', '.join(fw.get('puertos_a_revisar', [])) or 'ninguno'}",
     ]
-    for adv in fw.get("advertencias", []):
-        lineas.append(f"  [⚠] {adv}")
+    lineas += _avisos(fw)
 
     u = resultados.get("usuarios", {})
     lineas += [
@@ -1088,27 +1410,26 @@ def generar_reporte_txt(resultados: dict, ruta_salida: Optional[str] = None) -> 
         f"  Usuarios con UID 0 (≠root) : {', '.join(u.get('usuarios_uid0_no_root', [])) or 'ninguno'}",
         f"  Cuentas sin contraseña     : {', '.join(u.get('cuentas_sin_contrasena', [])) or 'ninguna'}",
     ]
-    for adv in u.get("advertencias", []):
-        lineas.append(f"  [⚠] {adv}")
+    lineas += _avisos(u)
 
     # ── Sección SSH ───────────────────────────────────────────────────────────
     lineas += [
         "",
         _sep("[5] AUDITORÍA DE SSH"),
         _sep(),
-        f"  Archivo analizado  : {s.get('ruta_config', RUTA_SSHD_CFG)}",
-        f"  Puerto SSH activo  : {s.get('puerto_ssh', '22')}",
+        f"  Configuración       : {s.get('ruta_config', RUTA_SSHD_CFG)}",
+        f"  Fuente              : {s.get('fuente', 'N/A')}",
+        f"  Puerto(s) SSH       : {s.get('puerto_ssh', '22')}",
         f"  Directivas de riesgo: {len(s.get('directivas_riesgo', []))}",
     ]
     if s.get("directivas_riesgo"):
         lineas.append("  Detalle de hallazgos:")
         for h in s["directivas_riesgo"]:
-            lineas.append(f"    [✘] Línea {h['linea_num']:>4}: {h['directiva']} {h['valor']}")
+            lineas.append(f"    [✘] {h['origen']}: {h['directiva']} {h['valor']}")
             lineas.append(f"         → {h['descripcion']}")
     else:
-        lineas.append("  [✔] No se detectaron directivas SSH de alto riesgo.")
-    for adv in s.get("advertencias", []):
-        lineas.append(f"  [⚠] {adv}")
+        lineas.append("  [✔] No se detectaron directivas SSH de riesgo en la configuración global.")
+    lineas += _avisos(s)
 
     # ── Sección Actualizaciones ───────────────────────────────────────────────
     lineas += [
@@ -1119,6 +1440,11 @@ def generar_reporte_txt(resultados: dict, ruta_salida: Optional[str] = None) -> 
         f"  Estado              : {ac.get('estado', 'N/A')}",
         f"  Paquetes pendientes : {ac.get('total_pendientes', 0)}",
     ]
+    if ac.get("severidades"):
+        lineas.append(
+            "  Avisos por severidad: "
+            + ", ".join(f"{sev}: {n}" for sev, n in ac["severidades"].items())
+        )
     if ac.get("paquetes_pendientes"):
         lineas.append("  Listado (primeros 20):")
         for pkg in ac["paquetes_pendientes"][:20]:
@@ -1126,20 +1452,22 @@ def generar_reporte_txt(resultados: dict, ruta_salida: Optional[str] = None) -> 
         restantes = ac.get("total_pendientes", 0) - 20
         if restantes > 0:
             lineas.append(f"    ... y {restantes} paquete(s) más.")
-    for adv in ac.get("advertencias", []):
-        lineas.append(f"  [⚠] {adv}")
+    lineas += _avisos(ac)
 
-    total_adv = sum(
-        len(resultados.get(m, {}).get("advertencias", []))
-        for m in ("selinux", "firewall", "usuarios", "ssh", "actualizaciones")
-    )
+    total_adv = _total_advertencias(resultados)
     lineas += [
         "",
         "=" * 64,
         "RESUMEN EJECUTIVO",
         "=" * 64,
         f"  Nivel de riesgo global : {nivel_riesgo}",
+        f"  Estado de la auditoría : {estado_auditoria}",
         f"  Total de advertencias  : {total_adv}",
+    ]
+    if no_realizadas:
+        lineas.append("  Comprobaciones no realizadas (no suben el nivel de riesgo):")
+        lineas += [f"    [?] {err}" for err in no_realizadas]
+    lineas += [
         "",
         "  RECOMENDACIONES GENERALES (DRY-RUN):",
         "  1. Configurar SELinux en modo Enforcing si no lo está.",
@@ -1210,11 +1538,16 @@ def generar_reporte_html(resultados: dict, ruta_salida: Optional[str] = None) ->
             f'border-radius:4px;font-size:.82em;font-weight:700">{esc(texto)}</span>'
         )
 
-    def lista_adv(advs: list[str]) -> str:
-        if not advs:
+    def lista_adv(modulo: dict) -> str:
+        advs = modulo.get("advertencias", [])
+        errs = modulo.get("errores", [])
+        if not advs and not errs:
             return '<p style="color:#28a745;margin:4px 0">✔ Sin advertencias.</p>'
         items = "".join(
             f'<li style="color:#c0392b;margin-bottom:3px">⚠ {esc(a)}</li>' for a in advs
+        ) + "".join(
+            f'<li style="color:#6c757d;margin-bottom:3px">? No comprobado: {esc(e)}</li>'
+            for e in errs
         )
         return f'<ul style="margin:6px 0 0 18px;padding:0">{items}</ul>'
 
@@ -1233,16 +1566,18 @@ def generar_reporte_html(resultados: dict, ruta_salida: Optional[str] = None) ->
     s  = resultados.get("ssh", {})
     ac = resultados.get("actualizaciones", {})
 
-    total_adv = sum(
-        len(resultados.get(m, {}).get("advertencias", []))
-        for m in ("selinux", "firewall", "usuarios", "ssh", "actualizaciones")
+    total_adv = _total_advertencias(resultados)
+    no_realizadas = _comprobaciones_no_realizadas(resultados)
+    estado_auditoria = (
+        f"INCOMPLETA ({len(no_realizadas)} comprobación(es) no realizada(s))"
+        if no_realizadas else "COMPLETA"
     )
 
     # ── HTML tabla de directivas SSH peligrosas ───────────────────────────────
     if s.get("directivas_riesgo"):
         rows_ssh = "".join(
             f'<tr style="background:#fff5f5">'
-            f'<td style="padding:5px 10px;color:#c0392b;font-weight:700">Línea {esc(h["linea_num"])}</td>'
+            f'<td style="padding:5px 10px;color:#c0392b;font-weight:700">{esc(h["origen"])}</td>'
             f'<td style="padding:5px 10px;font-family:monospace">{esc(h["directiva"])} {esc(h["valor"])}</td>'
             f'<td style="padding:5px 10px;color:#7f0000">{esc(h["descripcion"])}</td>'
             f'</tr>'
@@ -1252,7 +1587,7 @@ def generar_reporte_html(resultados: dict, ruta_salida: Optional[str] = None) ->
         <table style="width:100%;border-collapse:collapse;margin-top:8px;font-size:.88em">
           <thead>
             <tr style="background:#f8d7da">
-              <th style="padding:6px 10px;text-align:left">Línea</th>
+              <th style="padding:6px 10px;text-align:left">Origen</th>
               <th style="padding:6px 10px;text-align:left">Directiva activa</th>
               <th style="padding:6px 10px;text-align:left">Descripción del riesgo</th>
             </tr>
@@ -1349,6 +1684,7 @@ def generar_reporte_html(resultados: dict, ruta_salida: Optional[str] = None) ->
     <span><b>Hostname:</b> {esc(hostname)}</span>
     <span><b>Módulos ejecutados:</b> 6</span>
     <span><b>Total advertencias:</b> {total_adv}</span>
+    <span><b>Auditoría:</b> {esc(estado_auditoria)}</span>
     <span><b>Nivel de riesgo:</b>
       <span style="color:{color_riesgo};font-weight:700">{nivel_riesgo}</span>
     </span>
@@ -1360,8 +1696,9 @@ def generar_reporte_html(resultados: dict, ruta_salida: Optional[str] = None) ->
     <table class="props">
       {fila("Estado:", badge(sl.get('ok', False), sl.get('estado','N/A'), sl.get('estado','N/A')))}
       {fila("Modo:", esc(sl.get('modo')))}
+      {fila("Modo persistente:", esc(sl.get('modo_persistente')))}
       {fila("Política cargada:", esc(sl.get('politica')))}
-      {fila("Advertencias:", lista_adv(sl.get('advertencias', [])))}
+      {fila("Advertencias:", lista_adv(sl))}
     </table>
   </div>
 
@@ -1370,12 +1707,13 @@ def generar_reporte_html(resultados: dict, ruta_salida: Optional[str] = None) ->
     <h2>[3] Gestión de Firewall</h2>
     <table class="props">
       {fila("Herramienta:", esc(fw.get('herramienta')))}
+      {fila("Zonas auditadas:", esc(', '.join(fw.get('zonas', [])) or 'N/A'))}
       {fila("Estado:", badge(fw.get('activo', False), 'Activo', 'Inactivo'))}
       {fila("Puertos abiertos:", esc(', '.join(fw.get('puertos_abiertos', [])) or '—'))}
       {fila("Puertos a revisar:",
         f'<span style="color:#e74c3c;font-weight:700">'
         f'{esc(", ".join(fw.get("puertos_a_revisar", [])) or "—")}</span>')}
-      {fila("Advertencias:", lista_adv(fw.get('advertencias', [])))}
+      {fila("Advertencias:", lista_adv(fw))}
     </table>
   </div>
 
@@ -1390,7 +1728,7 @@ def generar_reporte_html(resultados: dict, ruta_salida: Optional[str] = None) ->
       {fila("Sin contraseña:",
         f'<span style="color:#e74c3c;font-weight:700">'
         f'{esc(", ".join(u.get("cuentas_sin_contrasena", [])) or "✔ Ninguna")}</span>')}
-      {fila("Advertencias:", lista_adv(u.get('advertencias', [])))}
+      {fila("Advertencias:", lista_adv(u))}
     </table>
   </div>
 
@@ -1401,14 +1739,15 @@ def generar_reporte_html(resultados: dict, ruta_salida: Optional[str] = None) ->
     </h2>
     <table class="props">
       {fila("Archivo analizado:", f'<code style="background:#eee;padding:1px 5px;border-radius:3px">{esc(s.get("ruta_config", RUTA_SSHD_CFG))}</code>')}
-      {fila("Puerto SSH activo:", esc(s.get('puerto_ssh','22')))}
+      {fila("Fuente:", esc(s.get('fuente')))}
+      {fila("Puerto(s) SSH:", esc(s.get('puerto_ssh','22')))}
       {fila("Estado:", badge(
         s.get('ok', False),
         'Sin riesgos detectados',
         f'{len(s.get("directivas_riesgo", []))} directiva(s) de riesgo'
       ))}
       {fila("Directivas peligrosas:", ssh_directivas_html)}
-      {fila("Advertencias:", lista_adv(s.get('advertencias', [])))}
+      {fila("Advertencias:", lista_adv(s))}
     </table>
   </div>
 
@@ -1423,7 +1762,7 @@ def generar_reporte_html(resultados: dict, ruta_salida: Optional[str] = None) ->
       {fila("Paquetes pendientes:",
         f'<span style="color:{color_estado_ac};font-weight:700">{esc(ac.get("total_pendientes", 0))}</span>')}
       {fila("Listado:", paquetes_html) if paquetes_html else ""}
-      {fila("Advertencias:", lista_adv(ac.get('advertencias', [])))}
+      {fila("Advertencias:", lista_adv(ac))}
     </table>
   </div>
 
@@ -1481,6 +1820,12 @@ def parsear_argumentos(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=".",
         help="Directorio donde se guardan los reportes (por defecto: el actual).",
     )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="dnf usa solo su caché local (-C): no contacta con los repositorios "
+             "ni actualiza los metadatos en /var/cache/dnf.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1517,17 +1862,20 @@ def main(argv: Optional[list[str]] = None) -> None:
     # ── [2] Auditoría SELinux ─────────────────────────────────────────────────
     resultados["selinux"] = auditar_selinux()
 
+    # La configuración SSH se carga una vez: el firewall necesita sus puertos
+    config_ssh = cargar_config_ssh()
+
     # ── [3] Gestión de Firewall ───────────────────────────────────────────────
-    resultados["firewall"] = auditar_firewall()
+    resultados["firewall"] = auditar_firewall(config_ssh["puertos"])
 
     # ── [4] Auditoría de Usuarios ─────────────────────────────────────────────
     resultados["usuarios"] = auditar_usuarios()
 
     # ── [5] Auditoría de SSH ──────────────────────────────────────────────────
-    resultados["ssh"] = auditar_ssh()
+    resultados["ssh"] = auditar_ssh(config_ssh)
 
     # ── [6] Auditoría de Actualizaciones de Seguridad ─────────────────────────
-    resultados["actualizaciones"] = auditar_actualizaciones()
+    resultados["actualizaciones"] = auditar_actualizaciones(offline=args.offline)
 
     # ── [7] Generación de reportes ────────────────────────────────────────────
     print("=" * 64)
@@ -1549,6 +1897,9 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     print(f"\n{'=' * 64}")
     print(f"  Auditoría completada — Nivel de riesgo: {color}{nivel}{reset}")
+    no_realizadas = _comprobaciones_no_realizadas(resultados)
+    if no_realizadas:
+        print(f"  [?] Auditoría INCOMPLETA: {len(no_realizadas)} comprobación(es) no realizada(s)")
     print(f"  TXT  → {ruta_txt}")
     print(f"  HTML → {ruta_html}")
     print(f"{'=' * 64}\n")
