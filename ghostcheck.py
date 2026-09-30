@@ -3,7 +3,7 @@
 ==============================================================================
   GhostCheck — Auditoría de Seguridad para Servidores Linux / RHEL
   Modo: DRY-RUN (solo auditoría, sin cambios en el sistema)
-  Autor   : jaimefg1888
+  Autor   : jaimefgdev
   Tool    : GhostCheck
 
   Módulos de auditoría:

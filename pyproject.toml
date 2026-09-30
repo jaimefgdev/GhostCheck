@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = "Unlicense"
 license-files = ["LICENSE"]
-authors = [{ name = "jaimefg1888" }]
+authors = [{ name = "jaimefgdev" }]
 keywords = ["security", "audit", "rhel", "selinux", "firewalld", "ssh", "dry-run"]
 classifiers = [
     "Environment :: Console",
