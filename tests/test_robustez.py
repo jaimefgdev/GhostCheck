@@ -25,14 +25,14 @@ def test_shadow_con_bytes_no_utf8_no_aborta(etc):
 def test_passwd_que_es_un_directorio_no_aborta(etc):
     (etc / "passwd").mkdir()
     r = ghostcheck.auditar_usuarios()
-    assert any("passwd" in a for a in r["advertencias"])
+    assert any("passwd" in e for e in r["errores"])
 
 
 def test_sshd_config_con_bytes_no_utf8_no_aborta(etc):
     (etc / "ssh").mkdir()
     (etc / "ssh" / "sshd_config").write_bytes(b"# caf\xe9\nPermitRootLogin yes\n")
     r = ghostcheck.auditar_ssh()
-    assert [h["directiva"] for h in r["directivas_riesgo"]] == ["PermitRootLogin"]
+    assert "PermitRootLogin" in [h["directiva"] for h in r["directivas_riesgo"]]
 
 
 def test_include_que_apunta_a_un_directorio_no_aborta(etc):
@@ -41,14 +41,12 @@ def test_include_que_apunta_a_un_directorio_no_aborta(etc):
     (ssh / "sshd_config.d" / "10-ok.conf").write_text("X11Forwarding yes\n")
     (ssh / "sshd_config").write_text(f"Include {ssh}/sshd_config.d/*.conf\n")
     r = ghostcheck.auditar_ssh()
-    assert [h["directiva"] for h in r["directivas_riesgo"]] == ["X11Forwarding"]
+    assert "X11Forwarding" in [h["directiva"] for h in r["directivas_riesgo"]]
+    assert any("subdir.conf" in e for e in r["errores"])
 
 
 def test_firewall_se_detecta_sin_el_binario_which(comandos):
-    comandos.instalar("firewall-cmd")  # "which" NO está instalado
-    comandos.registrar(["systemctl", "is-active", "firewalld"], stdout="active")
-    comandos.registrar(["firewall-cmd", "--list-ports", "--zone=public"], stdout="")
-    comandos.registrar(["firewall-cmd", "--list-services", "--zone=public"], stdout="ssh")
+    comandos.firewalld_activo(servicios="ssh")  # "which" NO está instalado
     r = ghostcheck.auditar_firewall()
     assert r["herramienta"] == "firewalld"
     assert r["activo"] is True
@@ -56,10 +54,10 @@ def test_firewall_se_detecta_sin_el_binario_which(comandos):
 
 
 def test_ufw_se_detecta_sin_el_binario_which(comandos):
-    comandos.registrar(["ufw", "status", "verbose"], stdout="Status: active\n22/tcp ALLOW IN Anywhere\n")
+    comandos.registrar(["ufw", "status", "verbose"], stdout="Status: active\n22/tcp                     ALLOW IN    Anywhere\n")
     r = ghostcheck.auditar_firewall()
     assert r["herramienta"] == "ufw"
-    assert r["puertos_abiertos"] == ["22"]
+    assert r["puertos_abiertos"] == ["22/tcp"]
 
 
 def test_sin_gestor_de_firewall():
@@ -68,7 +66,7 @@ def test_sin_gestor_de_firewall():
 
 
 def test_dnf_se_detecta_sin_el_binario_which(comandos):
-    comandos.registrar(["dnf", "check-update", "--security"], codigo=0)
+    comandos.registrar(["dnf", "-q", "updateinfo", "list", "--security"], codigo=0)
     r = ghostcheck.auditar_actualizaciones()
     assert r["estado"] == "ACTUALIZADO"
 

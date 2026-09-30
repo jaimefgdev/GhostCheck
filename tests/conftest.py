@@ -37,10 +37,15 @@ COMANDOS_SOLO_LECTURA: tuple[tuple[str, ...], ...] = (
     ("getenforce",),
     ("sestatus",),
     ("systemctl", "is-active", "firewalld"),
-    ("firewall-cmd", "--list-ports",    r"--zone=[\w.-]+"),
-    ("firewall-cmd", "--list-services", r"--zone=[\w.-]+"),
+    ("firewall-cmd", "--get-default-zone"),
+    ("firewall-cmd", "--get-active-zones"),
+    ("firewall-cmd", r"--list-(?:ports|services|rich-rules|forward-ports)", r"--zone=[\w.-]+"),
+    ("firewall-cmd", r"--info-service=[\w.-]+"),
     ("ufw", "status", "verbose"),
-    ("dnf", "check-update", "--security"),
+    ("ufw", "app", "info", r"[\w .+-]+"),
+    ("sshd", "-T", "-f", r"/[\w./-]+"),
+    ("dnf", "-q", "updateinfo", "list", "--security"),
+    ("dnf", "-q", "-C", "updateinfo", "list", "--security"),
     ("hostname", "-f"),
 )
 
@@ -69,6 +74,18 @@ class ComandosSimulados:
     instalados: set[str] = field(default_factory=set)
     ejecutados: list[list[str]] = field(default_factory=list)
     kwargs_run: list[dict] = field(default_factory=list)
+
+    def firewalld_activo(self, zona: str = "public", puertos: str = "", servicios: str = "",
+                         rich: str = "", forward: str = "", zonas_activas: str | None = None) -> None:
+        """Atajo: firewalld activo con una zona y su contenido."""
+        self.registrar(["systemctl", "is-active", "firewalld"], stdout="active")
+        self.registrar(["firewall-cmd", "--get-default-zone"], stdout=zona)
+        self.registrar(["firewall-cmd", "--get-active-zones"],
+                       stdout=zonas_activas if zonas_activas is not None
+                       else f"{zona}\n  interfaces: eth0")
+        for tipo, valor in (("ports", puertos), ("services", servicios),
+                            ("rich-rules", rich), ("forward-ports", forward)):
+            self.registrar(["firewall-cmd", f"--list-{tipo}", f"--zone={zona}"], stdout=valor)
 
     def registrar(self, comando: list[str], codigo: int = 0, stdout: str = "",
                   stderr: str = "", excepcion: BaseException | None = None) -> None:
@@ -122,6 +139,7 @@ def sistema_aislado(monkeypatch, tmp_path, comandos):
     monkeypatch.setattr(ghostcheck, "RUTA_PASSWD", str(etc / "passwd"))
     monkeypatch.setattr(ghostcheck, "RUTA_SHADOW", str(etc / "shadow"))
     monkeypatch.setattr(ghostcheck, "RUTA_SSHD_CFG", str(etc / "ssh" / "sshd_config"))
+    monkeypatch.setattr(ghostcheck, "RUTA_SELINUX_CFG", str(etc / "selinux" / "config"))
     monkeypatch.chdir(tmp_path)
     return ejecutar_real
 
