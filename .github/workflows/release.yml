@@ -1,0 +1,91 @@
+name: Release
+
+# Al publicar un tag v* (p. ej. v1.0.0): comprueba la versión, construye el RPM en
+# Rocky Linux 9, lo instala y lo ejecuta, y publica una GitHub Release con el RPM,
+# ghostcheck.py y sus SHA-256. En un PR que toque el empaquetado, o lanzado a mano,
+# solo construye y prueba: no publica nada.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+  pull_request:
+    paths: [".github/workflows/release.yml", "packaging/**", "ghostcheck.py"]
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Comprobar versión
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: El tag, ghostcheck.py y el .spec dicen la misma versión
+        run: |
+          py=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' ghostcheck.py)
+          spec=$(sed -n 's/^Version:[[:space:]]*//p' packaging/ghostcheck.spec)
+          echo "ghostcheck.py=$py  spec=$spec  ref=$GITHUB_REF_NAME"
+          [ "$py" = "$spec" ] || { echo "::error::ghostcheck.py ($py) y el .spec ($spec) no coinciden"; exit 1; }
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$GITHUB_REF_NAME" != "v$py" ]; then
+            echo "::error::El tag $GITHUB_REF_NAME no coincide con la versión $py"; exit 1
+          fi
+
+  rpm:
+    name: Construir y probar el RPM (Rocky Linux 9)
+    needs: version
+    runs-on: ubuntu-latest
+    container: rockylinux:9
+    steps:
+      - uses: actions/checkout@v7
+      - name: Construir el RPM
+        run: |
+          dnf -q -y install rpm-build python3
+          rpmbuild -bb --define "_sourcedir $PWD" --define "_rpmdir $PWD/dist" packaging/ghostcheck.spec
+          ls -l dist/noarch
+      - name: Instalarlo y ejecutarlo (solo --version y --help)
+        run: |
+          rpm -ivh dist/noarch/ghostcheck-*.noarch.rpm
+          ghostcheck --version
+          ghostcheck --help > /dev/null
+      - name: Preparar los ficheros de la release
+        run: |
+          mkdir -p release
+          cp dist/noarch/ghostcheck-*.noarch.rpm ghostcheck.py release/
+          cd release && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release
+          path: release/
+          if-no-files-found: error
+
+  publicar:
+    name: Publicar la GitHub Release
+    if: github.ref_type == 'tag'
+    needs: rpm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release
+          path: release
+      - name: Crear la release con el RPM, el script y los SHA-256
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "## Descarga"
+            echo
+            echo "- **RPM** (RHEL / Rocky / AlmaLinux 9): \`sudo dnf install ./$(ls release/*.rpm | xargs -n1 basename)\`"
+            echo "- **Un solo fichero**: \`sudo python3 ghostcheck.py\`"
+            echo
+            echo "## SHA-256"
+            echo
+            echo '```'
+            cat release/SHA256SUMS
+            echo '```'
+          } > notas.md
+          gh release create "$GITHUB_REF_NAME" release/* \
+            --repo "$GITHUB_REPOSITORY" --title "GhostCheck $GITHUB_REF_NAME" \
+            --notes-file notas.md --generate-notes
